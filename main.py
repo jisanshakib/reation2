@@ -8,7 +8,7 @@ import sys
 
 from telegram.ext import Application
 
-from config import BOT_TOKEN, SUPABASE_URL, SUPABASE_KEY, PORT
+from config import BOT_TOKEN, SUPABASE_URL, SUPABASE_KEY, PORT, HEALTH_CHECK_INTERVAL
 from database import Database
 from reactor import Reactor
 from bot_handlers import setup_handlers
@@ -24,6 +24,8 @@ log = logging.getLogger(__name__)
 async def post_init(app: Application) -> None:
     """Called after the bot Application is initialised but before polling."""
     reactor: Reactor = app.bot_data["reactor"]
+    # Give the reactor a reference to the Bot so it can send health alerts.
+    reactor.set_bot(app.bot)
     await reactor.start()
     log.info("Reactor initialised inside post_init.")
 
@@ -55,7 +57,7 @@ def main() -> None:
 
     # ---- Shared objects -------------------------------------------- #
     db = Database(SUPABASE_URL, SUPABASE_KEY)
-    reactor = Reactor(db)
+    reactor = Reactor(db, health_interval=HEALTH_CHECK_INTERVAL)
 
     # ---- Build the bot application --------------------------------- #
     app = (
@@ -74,8 +76,6 @@ def main() -> None:
     setup_handlers(app, db, reactor)
 
     # ---- Start the health-check server ----------------------------- #
-    # We schedule it via post_init-style, but since Application.run_polling
-    # manages the loop, we start health in a pre-run coroutine.
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 

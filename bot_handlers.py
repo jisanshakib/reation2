@@ -1,8 +1,10 @@
-"""100 % Inline-Keyboard-driven Telegram bot UI.
+"""100 % Inline-Keyboard-driven Telegram bot UI  (v3).
 
-Every navigation action is a callback-query button press.  Text input from
-the user is only requested during state-based flows (registration, check,
-add-channel, add-emoji) and is always preceded by an inline-keyboard prompt.
+v3 changes
+──────────
+• Multi-tier roles: Owner → Admin → Moderator with per-role button visibility.
+• Account-add flow now uses a two-step role selector (admin vs moderator).
+• Help guide updated with role descriptions.
 """
 
 from __future__ import annotations
@@ -24,76 +26,118 @@ from telegram.ext import (
     filters,
 )
 
-from config import BOT_TOKEN, OWNER_IDS
+from config import PERMANENT_OWNER_ID
 from database import Database
 from reactor import Reactor
 
 log = logging.getLogger(__name__)
 
 # ------------------------------------------------------------------ #
-#  In-memory user states (keyed by ``user_id``)                      #
+#  In-memory user states  (keyed by ``user_id``)                     #
 # ------------------------------------------------------------------ #
 # States: reg_name, reg_phone, reg_api_id, reg_api_hash, reg_session,
-#          check, add_channel, add_emoji
+#         check, add_channel, add_emoji, add_role_user, add_role_select
 
 user_states: dict[int, dict[str, Any]] = {}
 
-# Module-level references set by ``setup_handlers``.
+# Module-level references – set once by ``setup_handlers``.
 db: Database = None  # type: ignore[assignment]
 reactor: Reactor = None  # type: ignore[assignment]
 
 
-def _is_owner(user_id: int) -> bool:
-    """Return True if *user_id* is in the configured owner list."""
-    return user_id in OWNER_IDS
+# ================================================================== #
+#  Role helpers                                                       #
+# ================================================================== #
+
+_ROLE_ICON = {"owner": "👑", "admin": "🛡️", "moderator": "👁️"}
 
 
-# =================================================================== #
+def _is_permanent_owner(user_id: int) -> bool:
+    return user_id == PERMANENT_OWNER_ID
+
+
+def _get_role(user_id: int) -> str | None:
+    """Return ``'owner'``, ``'admin'``, ``'moderator'``, or ``None``."""
+    if _is_permanent_owner(user_id):
+        return "owner"
+    return db.get_role_for_user(user_id)
+
+
+def _is_authorized(user_id: int) -> bool:
+    return _get_role(user_id) is not None
+
+
+def _can_manage_roles(user_id: int) -> bool:
+    return _get_role(user_id) == "owner"
+
+
+def _can_manage_accounts(user_id: int) -> bool:
+    """Owner and Admin can add / delete / check accounts."""
+    return _get_role(user_id) in ("owner", "admin")
+
+
+# Moderator+ can manage channels and emojis.
+def _can_manage_channels(user_id: int) -> bool:
+    return _get_role(user_id) in ("owner", "admin", "moderator")
+
+
+# ================================================================== #
 #  Keyboard builders                                                  #
-# =================================================================== #
+# ================================================================== #
 
 def _back_button(target: str = "main") -> InlineKeyboardButton:
     return InlineKeyboardButton("⬅️ Back", callback_data=target)
 
 
-def _main_menu_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [
-            [InlineKeyboardButton("📱 Accounts", callback_data="accounts")],
-            [InlineKeyboardButton("📡 Channels", callback_data="channels")],
-            [InlineKeyboardButton("😀 Emojis", callback_data="emojis")],
-        ]
-    )
+def _main_menu_kb(user_id: int) -> InlineKeyboardMarkup:
+    role = _get_role(user_id)
+    rows: list[list[InlineKeyboardButton]] = [
+        [InlineKeyboardButton("📱 Accounts", callback_data="accounts")],
+        [InlineKeyboardButton("📡 Channels", callback_data="channels")],
+        [InlineKeyboardButton("😀 Emojis", callback_data="emojis")],
+    ]
+    if role == "owner":
+        rows.append([InlineKeyboardButton("👑 Admins", callback_data="admins")])
+    rows.append([InlineKeyboardButton("📖 Help Guide", callback_data="help")])
+    return InlineKeyboardMarkup(rows)
 
 
-def _accounts_kb(accounts: list[dict]) -> InlineKeyboardMarkup:
+# ── Accounts ────────────────────────────────────────────────────── #
+
+def _accounts_kb(accounts: list[dict], can_add: bool) -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = []
     for acc in accounts:
         icon = "🟢" if acc["status"] == "active" else "🔴"
-        label = f"{icon} {acc['name']}"
-        rows.append([InlineKeyboardButton(label, callback_data=f"acc:{acc['id']}")])
-    rows.append([InlineKeyboardButton("➕ Add Account", callback_data="acc_add")])
+        rows.append(
+            [InlineKeyboardButton(f"{icon} {acc['name']}", callback_data=f"acc:{acc['id']}")]
+        )
+    if can_add:
+        rows.append([InlineKeyboardButton("➕ Add Account", callback_data="acc_add")])
     rows.append([_back_button()])
     return InlineKeyboardMarkup(rows)
 
 
-def _account_detail_kb(acc_id: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [
+def _account_detail_kb(acc_id: str, can_manage: bool) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    if can_manage:
+        rows.append(
             [
                 InlineKeyboardButton("Check 🔍", callback_data=f"acc_chk:{acc_id}"),
                 InlineKeyboardButton("Delete 🗑️", callback_data=f"acc_del:{acc_id}"),
-            ],
-            [_back_button("accounts")],
-        ]
-    )
+            ]
+        )
+    rows.append([_back_button("accounts")])
+    return InlineKeyboardMarkup(rows)
 
+
+# ── Channels ────────────────────────────────────────────────────── #
 
 def _channels_kb(channels: list[dict]) -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = []
     for ch in channels:
-        label = f"📡 {ch['channel_name']}"
-        rows.append([InlineKeyboardButton(label, callback_data=f"ch:{ch['id']}")])
+        rows.append(
+            [InlineKeyboardButton(f"📡 {ch['channel_name']}", callback_data=f"ch:{ch['id']}")]
+        )
     rows.append([InlineKeyboardButton("➕ Add Channel", callback_data="ch_add")])
     rows.append([_back_button()])
     return InlineKeyboardMarkup(rows)
@@ -108,9 +152,10 @@ def _channel_detail_kb(ch_id: str) -> InlineKeyboardMarkup:
     )
 
 
+# ── Emojis ──────────────────────────────────────────────────────── #
+
 def _emojis_kb(emojis: list[dict]) -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = []
-    # Lay emojis out in rows of 5 buttons.
     row: list[InlineKeyboardButton] = []
     for em in emojis:
         row.append(InlineKeyboardButton(em["emoji"], callback_data=f"em:{em['id']}"))
@@ -124,6 +169,8 @@ def _emojis_kb(emojis: list[dict]) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
+# ── Confirm ─────────────────────────────────────────────────────── #
+
 def _confirm_delete_kb(prefix: str, item_id: str, back_target: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
@@ -135,64 +182,174 @@ def _confirm_delete_kb(prefix: str, item_id: str, back_target: str) -> InlineKey
     )
 
 
-# =================================================================== #
-#  /start – the only text-command; shows the main menu                #
-# =================================================================== #
+# ── Admin panel ─────────────────────────────────────────────────── #
+
+def _admins_kb(roles: list[dict]) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    for r in roles:
+        icon = _ROLE_ICON.get(r["role"], "👤")
+        rows.append(
+            [InlineKeyboardButton(f"{icon} {r['user_id']}  ({r['role']})", callback_data=f"adm:{r['id']}")]
+        )
+    rows.append([InlineKeyboardButton("➕ Add User", callback_data="adm_add")])
+    rows.append([_back_button()])
+    return InlineKeyboardMarkup(rows)
+
+
+def _admin_detail_kb(role_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("🗑️ Revoke", callback_data=f"adm_del:{role_id}")],
+            [_back_button("admins")],
+        ]
+    )
+
+
+def _role_select_kb() -> InlineKeyboardMarkup:
+    """Shown after the owner enters a user ID – pick admin or moderator."""
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("🛡️ Admin", callback_data="set_role:admin"),
+                InlineKeyboardButton("👁️ Moderator", callback_data="set_role:moderator"),
+            ],
+            [InlineKeyboardButton("❌ Cancel", callback_data="admins")],
+        ]
+    )
+
+
+# ================================================================== #
+#  Help text                                                          #
+# ================================================================== #
+
+_HELP_TEXT = (
+    "📖 *Auto-Reaction Bot — User Guide*\n"
+    "━━━━━━━━━━━━━━━━━━━━\n\n"
+
+    "*👑 Role Permissions*\n"
+    "• *Owner* — full control, manage admins & moderators.\n"
+    "• *Admin* 🛡️ — manage accounts, channels, emojis.\n"
+    "• *Moderator* 👁️ — add channels & emojis, view accounts (read-only).\n\n"
+
+    "*📱 Adding Accounts (StringSession)*\n"
+    "1. Go to https://my.telegram.org → log in → create an app.\n"
+    "2. Note your *API ID* and *API Hash*.\n"
+    "3. Generate a Session String:\n"
+    "`from telethon.sync import TelegramClient`\n"
+    "`from telethon.sessions import StringSession`\n"
+    "`with TelegramClient(StringSession(), API_ID, API_HASH) as c:`\n"
+    "`    print(c.session.save())`\n"
+    "4. In the bot tap *📱 Accounts → ➕ Add Account* and follow the 5-step wizard "
+    "(Name → Phone → API ID → API Hash → Session String).\n\n"
+
+    "*📡 Adding Target Channels*\n"
+    "1. Find the channel's numeric ID (e.g. forward a msg to @userinfobot).\n"
+    "2. Tap *📡 Channels → ➕ Add Channel*.\n"
+    "3. Send the ID and name: `-1001234567890 My Channel`\n"
+    "4. Make sure every registered account has *joined* the channel.\n\n"
+
+    "*😀 Managing Reaction Emojis*\n"
+    "• Tap *😀 Emojis → ➕ Add Emoji* and send a single emoji.\n"
+    "• Tap any listed emoji to remove it.\n"
+    "• Only emojis that Telegram allows as reactions will work "
+    "(👍 ❤️ 🔥 🎉 😢 etc.).\n\n"
+
+    "*🔒 Security & Rate-Limit Tips*\n"
+    "• Never share your Session String.\n"
+    "• Keep fewer than 5 accounts to stay under Telegram's radar.\n"
+    "• 1-second gap between accounts is enforced — do *not* lower it.\n"
+    "• FloodWait → account auto-cools down, no action needed.\n"
+    "• 🔴 Health alerts are sent to the Owner if a session expires."
+)
+
+
+# ================================================================== #
+#  /start command                                                     #
+# ================================================================== #
 
 async def cmd_start(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id  # type: ignore[union-attr]
-    if not _is_owner(user_id):
+    if not _is_authorized(user_id):
         await update.message.reply_text("⛔ You are not authorised to use this bot.")  # type: ignore[union-attr]
         return
     user_states.pop(user_id, None)
     await update.message.reply_text(  # type: ignore[union-attr]
         "🤖 *Auto-Reaction Bot*\n\nSelect an option:",
-        reply_markup=_main_menu_kb(),
+        reply_markup=_main_menu_kb(user_id),
         parse_mode="Markdown",
     )
 
 
-# =================================================================== #
+# ================================================================== #
 #  Callback-query dispatcher                                          #
-# =================================================================== #
+# ================================================================== #
 
-async def callback_handler(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
+async def callback_handler(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:  # noqa: C901
     query = update.callback_query
     assert query is not None
     await query.answer()
 
     user_id = query.from_user.id
-    if not _is_owner(user_id):
+    if not _is_authorized(user_id):
         await query.answer("⛔ Unauthorised", show_alert=True)
         return
 
     data: str = query.data or ""
+    role = _get_role(user_id)
 
-    # Clear any pending text-input state unless we're in a registration flow
-    # that the user intentionally entered.
-    if not data.startswith(("acc_add", "skip_phone", "ch_add", "em_add", "cancel")):
+    # Keep state during active input flows.
+    keep = ("acc_add", "skip_phone", "ch_add", "em_add", "adm_add", "set_role", "cancel")
+    if not data.startswith(keep):
         user_states.pop(user_id, None)
 
-    # ---- Navigation ------------------------------------------------ #
+    # ─── Main menu ─────────────────────────────────────────────── #
     if data == "main":
         user_states.pop(user_id, None)
         await query.edit_message_text(
             "🤖 *Auto-Reaction Bot*\n\nSelect an option:",
-            reply_markup=_main_menu_kb(),
+            reply_markup=_main_menu_kb(user_id),
             parse_mode="Markdown",
         )
 
-    # ---- Accounts -------------------------------------------------- #
+    # ─── Help ──────────────────────────────────────────────────── #
+    elif data == "help":
+        await query.edit_message_text(
+            _HELP_TEXT,
+            reply_markup=InlineKeyboardMarkup([[_back_button()]]),
+            parse_mode="Markdown",
+            disable_web_page_preview=True,
+        )
+
+    # ─── Accounts ──────────────────────────────────────────────── #
     elif data == "accounts":
-        accs = db.get_accounts(owner_id=user_id)
-        text = "📱 *Your Accounts*\n\nSelect an account or add a new one:"
-        await query.edit_message_text(text, reply_markup=_accounts_kb(accs), parse_mode="Markdown")
+        can_manage = _can_manage_accounts(user_id)
+        # Owner sees ALL accounts; Admin sees own; Moderator sees all (read-only).
+        if role == "owner":
+            accs = db.get_all_accounts()
+            title = "📱 *All Accounts*"
+        elif role == "admin":
+            accs = db.get_accounts(owner_id=user_id)
+            title = "📱 *Your Accounts*"
+        else:
+            accs = db.get_all_accounts()
+            title = "📱 *Accounts* _(read-only)_"
+
+        await query.edit_message_text(
+            f"{title}\n\nSelect an account{' or add a new one' if can_manage else ''}:",
+            reply_markup=_accounts_kb(accs, can_add=can_manage),
+            parse_mode="Markdown",
+        )
 
     elif data == "acc_add":
+        if not _can_manage_accounts(user_id):
+            await query.answer("⛔ Admins and Owner only", show_alert=True)
+            return
         user_states[user_id] = {"step": "reg_name", "data": {}}
         await query.edit_message_text(
             "📝 *Register Account — Step 1/5*\n\nSend the *Account Name*:",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="accounts")]]),
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("❌ Cancel", callback_data="accounts")]]
+            ),
             parse_mode="Markdown",
         )
 
@@ -200,11 +357,18 @@ async def callback_handler(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> N
         acc_id = data.split(":", 1)[1]
         acc = db.get_account(acc_id)
         if acc is None:
-            await query.edit_message_text("Account not found.", reply_markup=InlineKeyboardMarkup([[_back_button("accounts")]]))
+            await query.edit_message_text(
+                "Account not found.",
+                reply_markup=InlineKeyboardMarkup([[_back_button("accounts")]]),
+            )
             return
-        if acc["owner_id"] != user_id:
+
+        can_manage = _can_manage_accounts(user_id)
+        # Ownership check: owner can view any; admin own only; moderator any (view).
+        if role == "admin" and acc["owner_id"] != user_id:
             await query.answer("⛔ Not your account", show_alert=True)
             return
+
         icon = "🟢 Active" if acc["status"] == "active" else "🔴 Failed"
         text = (
             f"📱 *Account Detail*\n\n"
@@ -214,9 +378,16 @@ async def callback_handler(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> N
             f"• *API Hash:* `{acc['api_hash'][:8]}…`\n"
             f"• *Status:* {icon}"
         )
-        await query.edit_message_text(text, reply_markup=_account_detail_kb(acc_id), parse_mode="Markdown")
+        await query.edit_message_text(
+            text,
+            reply_markup=_account_detail_kb(acc_id, can_manage=can_manage),
+            parse_mode="Markdown",
+        )
 
     elif data.startswith("acc_chk:"):
+        if not _can_manage_accounts(user_id):
+            await query.answer("⛔ Admins and Owner only", show_alert=True)
+            return
         acc_id = data.split(":", 1)[1]
         user_states[user_id] = {"step": "check", "data": {"account_id": acc_id}}
         await query.edit_message_text(
@@ -229,8 +400,15 @@ async def callback_handler(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> N
         )
 
     elif data.startswith("acc_del:"):
+        if not _can_manage_accounts(user_id):
+            await query.answer("⛔ Admins and Owner only", show_alert=True)
+            return
         acc_id = data.split(":", 1)[1]
         acc = db.get_account(acc_id)
+        # Admin can only delete own; owner can delete any.
+        if acc and role == "admin" and acc["owner_id"] != user_id:
+            await query.answer("⛔ Not your account", show_alert=True)
+            return
         name = acc["name"] if acc else "?"
         await query.edit_message_text(
             f"⚠️ *Delete account* `{name}`?",
@@ -239,9 +417,12 @@ async def callback_handler(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> N
         )
 
     elif data.startswith("acc_del_y:"):
+        if not _can_manage_accounts(user_id):
+            await query.answer("⛔ Admins and Owner only", show_alert=True)
+            return
         acc_id = data.split(":", 1)[1]
         acc = db.get_account(acc_id)
-        if acc and acc["owner_id"] != user_id:
+        if acc and role == "admin" and acc["owner_id"] != user_id:
             await query.answer("⛔ Not your account", show_alert=True)
             return
         await reactor.remove_client(acc_id)
@@ -251,7 +432,7 @@ async def callback_handler(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> N
             reply_markup=InlineKeyboardMarkup([[_back_button("accounts")]]),
         )
 
-    # ---- Skip phone ------------------------------------------------ #
+    # ─── Skip phone ────────────────────────────────────────────── #
     elif data == "skip_phone":
         state = user_states.get(user_id)
         if state and state["step"] == "reg_phone":
@@ -259,15 +440,20 @@ async def callback_handler(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> N
             state["step"] = "reg_api_id"
             await query.edit_message_text(
                 "📝 *Register Account — Step 3/5*\n\nSend the *API ID*:",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="accounts")]]),
+                reply_markup=InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("❌ Cancel", callback_data="accounts")]]
+                ),
                 parse_mode="Markdown",
             )
 
-    # ---- Channels -------------------------------------------------- #
+    # ─── Channels ──────────────────────────────────────────────── #
     elif data == "channels":
         channels = db.get_channels()
-        text = "📡 *Target Channels*\n\nSelect a channel or add a new one:"
-        await query.edit_message_text(text, reply_markup=_channels_kb(channels), parse_mode="Markdown")
+        await query.edit_message_text(
+            "📡 *Target Channels*\n\nSelect a channel or add a new one:",
+            reply_markup=_channels_kb(channels),
+            parse_mode="Markdown",
+        )
 
     elif data == "ch_add":
         user_states[user_id] = {"step": "add_channel", "data": {}}
@@ -275,7 +461,9 @@ async def callback_handler(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> N
             "📡 *Add Channel*\n\nSend the *channel ID* (numeric, e.g. `-1001234567890`)\n"
             "and *channel name* separated by a space.\n\n"
             "Example: `-1001234567890 My Channel`",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="channels")]]),
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("❌ Cancel", callback_data="channels")]]
+            ),
             parse_mode="Markdown",
         )
 
@@ -283,10 +471,15 @@ async def callback_handler(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> N
         ch_id = data.split(":", 1)[1]
         ch = db.get_channel(ch_id)
         if ch is None:
-            await query.edit_message_text("Channel not found.", reply_markup=InlineKeyboardMarkup([[_back_button("channels")]]))
+            await query.edit_message_text(
+                "Channel not found.",
+                reply_markup=InlineKeyboardMarkup([[_back_button("channels")]]),
+            )
             return
         text = f"📡 *Channel*\n\n• *Name:* {ch['channel_name']}\n• *ID:* `{ch['channel_id']}`"
-        await query.edit_message_text(text, reply_markup=_channel_detail_kb(ch_id), parse_mode="Markdown")
+        await query.edit_message_text(
+            text, reply_markup=_channel_detail_kb(ch_id), parse_mode="Markdown"
+        )
 
     elif data.startswith("ch_del:"):
         ch_id = data.split(":", 1)[1]
@@ -307,17 +500,22 @@ async def callback_handler(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> N
             reply_markup=InlineKeyboardMarkup([[_back_button("channels")]]),
         )
 
-    # ---- Emojis ---------------------------------------------------- #
+    # ─── Emojis ────────────────────────────────────────────────── #
     elif data == "emojis":
         emojis = db.get_emojis()
-        text = "😀 *Allowed Emojis*\n\nTap an emoji to remove it, or add a new one:"
-        await query.edit_message_text(text, reply_markup=_emojis_kb(emojis), parse_mode="Markdown")
+        await query.edit_message_text(
+            "😀 *Allowed Emojis*\n\nTap an emoji to remove it, or add a new one:",
+            reply_markup=_emojis_kb(emojis),
+            parse_mode="Markdown",
+        )
 
     elif data == "em_add":
         user_states[user_id] = {"step": "add_emoji", "data": {}}
         await query.edit_message_text(
             "😀 *Add Emoji*\n\nSend the reaction emoji (e.g. 👍 🔥 ❤️):",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="emojis")]]),
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("❌ Cancel", callback_data="emojis")]]
+            ),
             parse_mode="Markdown",
         )
 
@@ -340,31 +538,133 @@ async def callback_handler(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> N
             reply_markup=InlineKeyboardMarkup([[_back_button("emojis")]]),
         )
 
-    # ---- Cancel (generic) ------------------------------------------ #
+    # ─── Admins panel  (owner only) ────────────────────────────── #
+    elif data == "admins":
+        if not _can_manage_roles(user_id):
+            await query.answer("⛔ Owner only", show_alert=True)
+            return
+        roles = db.get_user_roles()
+        await query.edit_message_text(
+            "👑 *User Role Management*\n\n"
+            "🛡️ Admin — accounts, channels, emojis\n"
+            "👁️ Moderator — channels, emojis, view accounts\n",
+            reply_markup=_admins_kb(roles),
+            parse_mode="Markdown",
+        )
+
+    elif data == "adm_add":
+        if not _can_manage_roles(user_id):
+            await query.answer("⛔ Owner only", show_alert=True)
+            return
+        user_states[user_id] = {"step": "add_role_user", "data": {}}
+        await query.edit_message_text(
+            "👑 *Add User*\n\nSend the Telegram *User ID*:",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("❌ Cancel", callback_data="admins")]]
+            ),
+            parse_mode="Markdown",
+        )
+
+    elif data.startswith("adm:"):
+        if not _can_manage_roles(user_id):
+            await query.answer("⛔ Owner only", show_alert=True)
+            return
+        role_id = data.split(":", 1)[1]
+        r = db.get_user_role(role_id)
+        if r is None:
+            await query.edit_message_text(
+                "User not found.",
+                reply_markup=InlineKeyboardMarkup([[_back_button("admins")]]),
+            )
+            return
+        icon = _ROLE_ICON.get(r["role"], "👤")
+        text = (
+            f"{icon} *User Detail*\n\n"
+            f"• *User ID:* `{r['user_id']}`\n"
+            f"• *Role:* {r['role']}\n"
+            f"• *Added by:* `{r['added_by']}`"
+        )
+        await query.edit_message_text(
+            text, reply_markup=_admin_detail_kb(role_id), parse_mode="Markdown"
+        )
+
+    elif data.startswith("adm_del:"):
+        if not _can_manage_roles(user_id):
+            await query.answer("⛔ Owner only", show_alert=True)
+            return
+        role_id = data.split(":", 1)[1]
+        r = db.get_user_role(role_id)
+        uid = r["user_id"] if r else "?"
+        role_name = r["role"] if r else "?"
+        await query.edit_message_text(
+            f"⚠️ *Revoke {role_name}* `{uid}`?",
+            reply_markup=_confirm_delete_kb("adm_del", role_id, f"adm:{role_id}"),
+            parse_mode="Markdown",
+        )
+
+    elif data.startswith("adm_del_y:"):
+        if not _can_manage_roles(user_id):
+            await query.answer("⛔ Owner only", show_alert=True)
+            return
+        role_id = data.split(":", 1)[1]
+        db.delete_user_role(role_id)
+        await query.edit_message_text(
+            "✅ User role revoked.",
+            reply_markup=InlineKeyboardMarkup([[_back_button("admins")]]),
+        )
+
+    # ─── Role selector (two-step from add_role_user) ───────────── #
+    elif data.startswith("set_role:"):
+        if not _can_manage_roles(user_id):
+            await query.answer("⛔ Owner only", show_alert=True)
+            return
+        state = user_states.get(user_id)
+        if not state or state["step"] != "add_role_select":
+            await query.answer("No pending user. Start again.", show_alert=True)
+            return
+        chosen_role = data.split(":", 1)[1]  # "admin" or "moderator"
+        target_uid = state["data"]["target_user_id"]
+        user_states.pop(user_id, None)
+        try:
+            db.add_user_role(target_uid, chosen_role, user_id)
+            icon = _ROLE_ICON.get(chosen_role, "👤")
+            await query.edit_message_text(
+                f"✅ User `{target_uid}` is now {icon} *{chosen_role}*!",
+                reply_markup=InlineKeyboardMarkup([[_back_button("admins")]]),
+                parse_mode="Markdown",
+            )
+        except Exception as e:
+            log.exception("Failed to add user role")
+            await query.edit_message_text(
+                f"❌ Failed: `{e}`",
+                reply_markup=InlineKeyboardMarkup([[_back_button("admins")]]),
+                parse_mode="Markdown",
+            )
+
+    # ─── Cancel ────────────────────────────────────────────────── #
     elif data == "cancel":
         user_states.pop(user_id, None)
         await query.edit_message_text(
             "🤖 *Auto-Reaction Bot*\n\nSelect an option:",
-            reply_markup=_main_menu_kb(),
+            reply_markup=_main_menu_kb(user_id),
             parse_mode="Markdown",
         )
 
 
-# =================================================================== #
-#  Text-message handler (state-driven input)                          #
-# =================================================================== #
+# ================================================================== #
+#  Text-message handler  (state-driven input)                         #
+# ================================================================== #
 
-async def text_handler(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
+async def text_handler(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:  # noqa: C901
     msg = update.message
     assert msg is not None
     user_id = msg.from_user.id  # type: ignore[union-attr]
 
-    if not _is_owner(user_id):
+    if not _is_authorized(user_id):
         return
 
     state = user_states.get(user_id)
     if state is None:
-        # No active state – show main menu hint.
         await msg.reply_text(
             "Use the buttons to navigate. Tap /start if you don't see them.",
         )
@@ -373,8 +673,11 @@ async def text_handler(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
     step = state["step"]
     text = msg.text or ""
 
-    # ---- Registration flow ----------------------------------------- #
+    # ── Registration flow (owner / admin only) ────────────────── #
     if step == "reg_name":
+        if not _can_manage_accounts(user_id):
+            user_states.pop(user_id, None)
+            return
         if not text.strip():
             await msg.reply_text("❗ Account name cannot be empty. Please try again.")
             return
@@ -396,7 +699,9 @@ async def text_handler(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
         state["step"] = "reg_api_id"
         await msg.reply_text(
             "📝 *Register Account — Step 3/5*\n\nSend the *API ID*:",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="accounts")]]),
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("❌ Cancel", callback_data="accounts")]]
+            ),
             parse_mode="Markdown",
         )
 
@@ -408,7 +713,9 @@ async def text_handler(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
         state["step"] = "reg_api_hash"
         await msg.reply_text(
             "📝 *Register Account — Step 4/5*\n\nSend the *API Hash*:",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="accounts")]]),
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("❌ Cancel", callback_data="accounts")]]
+            ),
             parse_mode="Markdown",
         )
 
@@ -420,7 +727,9 @@ async def text_handler(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
         state["step"] = "reg_session"
         await msg.reply_text(
             "📝 *Register Account — Step 5/5*\n\nSend the *Telethon Session String*:",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="accounts")]]),
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("❌ Cancel", callback_data="accounts")]]
+            ),
             parse_mode="Markdown",
         )
 
@@ -429,8 +738,6 @@ async def text_handler(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
             await msg.reply_text("❗ Session string cannot be empty. Please try again.")
             return
         state["data"]["session_str"] = text.strip()
-
-        # Persist to DB and connect in the reactor.
         d = state["data"]
         try:
             acc = db.add_account(
@@ -442,8 +749,6 @@ async def text_handler(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
                 session_str=d["session_str"],
             )
             user_states.pop(user_id, None)
-
-            # Try to connect immediately.
             try:
                 await reactor.add_client(acc)
                 status_msg = "🟢 Connected successfully!"
@@ -451,7 +756,6 @@ async def text_handler(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
                 log.exception("Failed to connect new account %s", acc["id"])
                 db.update_account_status(acc["id"], "failed")
                 status_msg = f"🔴 Saved but connection failed: `{e}`"
-
             await msg.reply_text(
                 f"✅ *Account registered!*\n\n{status_msg}",
                 reply_markup=InlineKeyboardMarkup([[_back_button("accounts")]]),
@@ -465,7 +769,7 @@ async def text_handler(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
                 parse_mode="Markdown",
             )
 
-    # ---- Check mode ------------------------------------------------ #
+    # ── Check mode ─────────────────────────────────────────────── #
     elif step == "check":
         acc_id = state["data"]["account_id"]
         user_states.pop(user_id, None)
@@ -476,7 +780,7 @@ async def text_handler(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
             parse_mode="Markdown",
         )
 
-    # ---- Add channel ----------------------------------------------- #
+    # ── Add channel ────────────────────────────────────────────── #
     elif step == "add_channel":
         user_states.pop(user_id, None)
         parts = text.strip().split(maxsplit=1)
@@ -495,7 +799,6 @@ async def text_handler(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
                 reply_markup=InlineKeyboardMarkup([[_back_button("channels")]]),
             )
             return
-
         channel_name = parts[1]
         try:
             db.add_channel(channel_id, channel_name, user_id)
@@ -513,7 +816,7 @@ async def text_handler(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
                 parse_mode="Markdown",
             )
 
-    # ---- Add emoji ------------------------------------------------- #
+    # ── Add emoji ──────────────────────────────────────────────── #
     elif step == "add_emoji":
         user_states.pop(user_id, None)
         emoji = text.strip()
@@ -538,10 +841,46 @@ async def text_handler(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
                 parse_mode="Markdown",
             )
 
+    # ── Add role – step 1: receive user ID ─────────────────────── #
+    elif step == "add_role_user":
+        if not _can_manage_roles(user_id):
+            user_states.pop(user_id, None)
+            return
+        raw = text.strip()
+        if not raw.isdigit():
+            await msg.reply_text(
+                "❗ User ID must be numeric.",
+                reply_markup=InlineKeyboardMarkup([[_back_button("admins")]]),
+            )
+            return
+        target_uid = int(raw)
+        if _is_permanent_owner(target_uid):
+            await msg.reply_text(
+                "ℹ️ The permanent owner is always authorised — no need to add.",
+                reply_markup=InlineKeyboardMarkup([[_back_button("admins")]]),
+            )
+            user_states.pop(user_id, None)
+            return
+        if target_uid in db.get_authorized_ids():
+            await msg.reply_text(
+                "ℹ️ This user already has a role. Revoke first to change it.",
+                reply_markup=InlineKeyboardMarkup([[_back_button("admins")]]),
+            )
+            user_states.pop(user_id, None)
+            return
+        # Transition to role selection.
+        state["step"] = "add_role_select"
+        state["data"]["target_user_id"] = target_uid
+        await msg.reply_text(
+            f"Choose a role for `{target_uid}`:",
+            reply_markup=_role_select_kb(),
+            parse_mode="Markdown",
+        )
 
-# =================================================================== #
-#  Application builder                                                #
-# =================================================================== #
+
+# ================================================================== #
+#  Application wiring                                                 #
+# ================================================================== #
 
 def setup_handlers(app: Application, database: Database, react: Reactor) -> None:
     """Register all handlers and inject shared dependencies."""

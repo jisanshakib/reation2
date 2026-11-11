@@ -1,16 +1,20 @@
 # Telegram Auto-Reaction Bot
 
-A fully inline-keyboard-driven Telegram bot that automatically reacts to messages in target channels using multiple Telethon user-accounts, with a Supabase-backed database.
+A fully inline-keyboard-driven Telegram bot that automatically reacts to messages in target channels using multiple Telethon user-accounts, with a Supabase-backed database and role-based admin management.
 
 ## Features
 
 | Area | Details |
 |---|---|
 | **UI** | 100 % Inline Keyboard – no text commands needed for navigation |
+| **Role-Based Access** | Permanent Owner (full control + admin management) and Admins (accounts, channels, emojis) |
+| **Admin Panel** | 👑 Owner-only panel to add/revoke admins via inline buttons |
+| **Help Guide** | 📖 In-app step-by-step user manual for all authorized users |
 | **Accounts** | Register multiple Telethon user-accounts (name, phone, API ID, API Hash, session string) |
 | **Channels** | Add / remove target channels dynamically |
 | **Emojis** | Manage the pool of allowed reaction emojis |
-| **Reactor** | Listens for new messages in target channels and reacts from every active account with a **1-second delay** between accounts |
+| **Reactor (v2)** | Non-blocking engine with peer caching, per-account flood cooldowns, fire-and-forget sweeps, and concurrent startup |
+| **DB Caching** | TTL cache on channels, emojis, and admin lookups to eliminate response lag |
 | **Health** | Lightweight `/healthz` endpoint for Render / Railway uptime checks |
 
 ---
@@ -19,10 +23,10 @@ A fully inline-keyboard-driven Telegram bot that automatically reacts to message
 
 ```
 main.py                 Entry point – wires everything together
-├── config.py           Env-var loader
-├── database.py         Supabase CRUD (accounts, channels, emojis)
-├── bot_handlers.py     python-telegram-bot inline-keyboard UI
-├── reactor.py          Telethon auto-reaction engine
+├── config.py           Env-var loader (BOT_TOKEN, SUPABASE_*, PERMANENT_OWNER_ID)
+├── database.py         Supabase CRUD + in-memory TTL cache
+├── bot_handlers.py     python-telegram-bot inline-keyboard UI + admin panel + help
+├── reactor.py          Telethon auto-reaction engine (v2, fully async)
 └── health.py           aiohttp /healthz server
 ```
 
@@ -33,12 +37,10 @@ main.py                 Entry point – wires everything together
 ### 1. Supabase Setup
 
 1. Create a new Supabase project.
-2. Open the **SQL Editor** and run [`schema.sql`](schema.sql) to create the three tables.
+2. Open the **SQL Editor** and run [`schema.sql`](schema.sql) to create the four tables (`accounts`, `channels`, `emojis`, `users_roles`).
 3. Copy your **Project URL** and **anon/service key**.
 
 ### 2. Environment Variables
-
-Copy `.env.example` to `.env` and fill in the values:
 
 ```bash
 cp .env.example .env
@@ -49,7 +51,7 @@ cp .env.example .env
 | `BOT_TOKEN` | Telegram bot token from [@BotFather](https://t.me/BotFather) |
 | `SUPABASE_URL` | Supabase project URL |
 | `SUPABASE_KEY` | Supabase anon or service-role key |
-| `OWNER_IDS` | Comma-separated Telegram user IDs allowed to manage the bot |
+| `PERMANENT_OWNER_ID` | Telegram user ID of the super-admin (default `6580282480`) |
 | `PORT` | Port for the health-check endpoint (default `8080`) |
 
 ### 3. Install & Run Locally
@@ -66,43 +68,55 @@ docker build -t auto-reaction-bot .
 docker run --env-file .env -p 8080:8080 auto-reaction-bot
 ```
 
-On **Render** or **Railway**, set the environment variables in the dashboard and use the `Dockerfile` for the build. The `/healthz` endpoint will keep the service alive.
+---
+
+## Role-Based Access
+
+| Role | Accounts | Channels | Emojis | Admin Panel | Help |
+|---|---|---|---|---|---|
+| **Permanent Owner** | ✅ | ✅ | ✅ | ✅ | ✅ |
+| **Admin** | ✅ | ✅ | ✅ | ❌ | ✅ |
+| **Unauthorised** | ❌ | ❌ | ❌ | ❌ | ❌ |
+
+- The **Permanent Owner** is set via `PERMANENT_OWNER_ID` and is always authorized.
+- **Admins** are stored in the `users_roles` Supabase table and managed via the 👑 Admins panel.
 
 ---
 
 ## Bot Usage
 
-1. **Start the bot** → Send `/start` to your bot in Telegram.
-2. **Main menu** appears with three buttons: **Accounts**, **Channels**, **Emojis**.
+1. **Start** → Send `/start` to your bot.
+2. **Main menu**: Accounts · Channels · Emojis · (Admins – owner only) · Help Guide.
 
 ### Adding an Account
-
-1. Tap **📱 Accounts** → **➕ Add Account**.
-2. Follow the 5-step flow:
-   - **Account Name** (required)
-   - **Phone Number** (optional – tap *Skip ⏭️*)
-   - **API ID**
-   - **API Hash**
-   - **Session String** (Telethon `StringSession`)
-3. The bot saves the account and tries to connect immediately.
+Tap **📱 Accounts → ➕ Add Account** and follow the 5-step wizard.
 
 ### Managing Channels
-
-1. Tap **📡 Channels** → **➕ Add Channel**.
-2. Send the channel ID and name: `-1001234567890 My Channel`
-3. The reactor begins listening immediately.
+Tap **📡 Channels → ➕ Add Channel** and send: `-1001234567890 My Channel`
 
 ### Managing Emojis
+Tap **😀 Emojis → ➕ Add Emoji** and send a reaction emoji.
 
-1. Tap **😀 Emojis** → **➕ Add Emoji**.
-2. Send the reaction emoji (e.g. `👍`).
-3. Tap any existing emoji button to remove it.
+### Managing Admins (Owner Only)
+Tap **👑 Admins → ➕ Add Admin** and send the Telegram user ID.
 
-### Checking an Account
+### Help Guide
+Tap **📖 Help Guide** for a detailed in-app user manual.
 
-1. Open an account's detail view.
-2. Tap **Check 🔍** and send a post link (e.g. `https://t.me/channel/123`).
-3. The bot sends a test reaction and reports the result.
+---
+
+## Reactor v2 – Performance Optimizations
+
+| Optimization | How |
+|---|---|
+| **Non-blocking sweeps** | Reaction sweeps run via `asyncio.create_task()` – the listener never blocks |
+| **Peer caching** | Resolved `InputPeer` objects cached per (account, channel) to skip repeated API calls |
+| **Flood cooldowns** | Per-account `FloodWaitError` cooldown tracking – no global sleep |
+| **Concurrent startup** | All accounts connect in parallel via `asyncio.gather()` |
+| **Bounded concurrency** | `asyncio.Semaphore` caps concurrent sweep tasks (default 5) |
+| **RPC timeouts** | Every Telethon call wrapped in `asyncio.wait_for()` (15 s default) |
+| **DB TTL cache** | Channels, emojis, and admin IDs cached for 30 s to eliminate Supabase round-trips |
+| **FIFO dedup** | `OrderedDict` with 10 K cap and FIFO eviction |
 
 ---
 

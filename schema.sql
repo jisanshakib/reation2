@@ -33,3 +33,22 @@ CREATE TABLE IF NOT EXISTS emojis (
     added_by    BIGINT       NOT NULL,
     created_at  TIMESTAMPTZ  NOT NULL DEFAULT now()
 );
+
+-- Multi-tier role assignments (managed by the Permanent Owner)
+-- Roles: 'admin' (full manage), 'moderator' (channels/emojis + read-only accounts)
+CREATE TABLE IF NOT EXISTS users_roles (
+    id          UUID DEFAULT gen_random_uuid() PRIMARY KEY,
+    user_id     BIGINT       NOT NULL UNIQUE,    -- Telegram user-id
+    role        TEXT         NOT NULL DEFAULT 'admin'
+                             CHECK (role IN ('admin', 'moderator')),
+    added_by    BIGINT       NOT NULL,            -- who granted the role
+    created_at  TIMESTAMPTZ  NOT NULL DEFAULT now()
+);
+
+-- ============================================================
+-- MIGRATION from v2 (single-role) to v3 (multi-tier):
+--
+--   ALTER TABLE users_roles DROP CONSTRAINT users_roles_role_check;
+--   ALTER TABLE users_roles ADD CONSTRAINT users_roles_role_check
+--       CHECK (role IN ('admin', 'moderator'));
+-- ============================================================

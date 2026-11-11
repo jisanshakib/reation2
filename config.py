@@ -12,10 +12,12 @@ BOT_TOKEN: str = os.getenv("BOT_TOKEN", "")
 SUPABASE_URL: str = os.getenv("SUPABASE_URL", "")
 SUPABASE_KEY: str = os.getenv("SUPABASE_KEY", "")
 
-# Comma-separated Telegram user IDs allowed to manage the bot
-OWNER_IDS: list[int] = [
-    int(x) for x in os.getenv("OWNER_IDS", "").split(",") if x.strip()
-]
+# Permanent owner – the single super-admin who can manage other admins.
+# This ID is ALWAYS authorised regardless of the users_roles table.
+PERMANENT_OWNER_ID: int = int(os.getenv("PERMANENT_OWNER_ID", "6580282480"))
 
 # Health-check server port (for Render / Railway)
 PORT: int = int(os.getenv("PORT", "8080"))
+
+# Account health-monitor interval in seconds (default: 5 minutes).
+HEALTH_CHECK_INTERVAL: int = int(os.getenv("HEALTH_CHECK_INTERVAL", "300"))
