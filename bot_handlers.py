@@ -1,10 +1,14 @@
-"""100 % Inline-Keyboard-driven Telegram bot UI  (v3).
+"""100 % Inline-Keyboard-driven Telegram bot UI  (v4).
 
-v3 changes
+v4 changes
 ──────────
-• Multi-tier roles: Owner → Admin → Moderator with per-role button visibility.
-• Account-add flow now uses a two-step role selector (admin vs moderator).
-• Help guide updated with role descriptions.
+• Top-level try/except in ``callback_handler`` and ``text_handler`` so
+  no unhandled exception can crash a callback or leave the UI hanging.
+• ``telegram.error.BadRequest: Message is not modified`` silently ignored
+  (user double-clicking the same button).
+• ``/addadmin <user_id> [admin|moderator]`` command handler (owner only).
+• Friendly "No items yet" messages when accounts/channels/emojis are empty.
+• All DB look-ups in callback_handler wrapped for safety.
 """
 
 from __future__ import annotations
@@ -17,6 +21,7 @@ from telegram import (
     InlineKeyboardMarkup,
     Update,
 )
+from telegram.error import BadRequest
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -259,7 +264,11 @@ _HELP_TEXT = (
     "• Keep fewer than 5 accounts to stay under Telegram's radar.\n"
     "• 1-second gap between accounts is enforced — do *not* lower it.\n"
     "• FloodWait → account auto-cools down, no action needed.\n"
-    "• 🔴 Health alerts are sent to the Owner if a session expires."
+    "• 🔴 Health alerts are sent to the Owner if a session expires.\n\n"
+
+    "*⌨️ Quick Commands*\n"
+    "• /start — open the main menu.\n"
+    "• /addadmin `<user_id>` `[admin|moderator]` — (Owner only) assign a role."
 )
 
 
@@ -281,6 +290,61 @@ async def cmd_start(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 # ================================================================== #
+#  /addadmin command  (owner only, v4)                                #
+# ================================================================== #
+
+async def cmd_addadmin(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Usage: ``/addadmin <user_id> [admin|moderator]``"""
+    msg = update.message
+    assert msg is not None
+    user_id = msg.from_user.id  # type: ignore[union-attr]
+
+    if not _can_manage_roles(user_id):
+        await msg.reply_text("⛔ Owner only.")
+        return
+
+    parts = (msg.text or "").split()
+    if len(parts) < 2:
+        await msg.reply_text(
+            "Usage: `/addadmin <user_id> [admin|moderator]`\n"
+            "Default role is *admin*.",
+            parse_mode="Markdown",
+        )
+        return
+
+    try:
+        target_uid = int(parts[1])
+    except ValueError:
+        await msg.reply_text("❗ User ID must be numeric.")
+        return
+
+    role = "admin"
+    if len(parts) >= 3 and parts[2].lower() in ("admin", "moderator"):
+        role = parts[2].lower()
+
+    if _is_permanent_owner(target_uid):
+        await msg.reply_text("ℹ️ The permanent owner is always authorised.")
+        return
+
+    if target_uid in db.get_authorized_ids():
+        await msg.reply_text(
+            "ℹ️ This user already has a role. Revoke first via the Admins panel."
+        )
+        return
+
+    try:
+        db.add_user_role(target_uid, role, user_id)
+        icon = _ROLE_ICON.get(role, "👤")
+        await msg.reply_text(
+            f"✅ User `{target_uid}` is now {icon} *{role}*!",
+            parse_mode="Markdown",
+        )
+    except Exception as e:
+        log.exception("Failed to add role via /addadmin")
+        await msg.reply_text(f"❌ Failed: `{e}`", parse_mode="Markdown")
+
+
+# ================================================================== #
 #  Callback-query dispatcher                                          #
 # ================================================================== #
 
@@ -296,6 +360,36 @@ async def callback_handler(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> N
 
     data: str = query.data or ""
     role = _get_role(user_id)
+
+    try:
+        await _route_callback(query, user_id, role, data)
+    except BadRequest as e:
+        # "Message is not modified" happens when user double-clicks a
+        # button that leads to the same content — harmless, ignore.
+        if "Message is not modified" in str(e):
+            log.debug("Ignored: Message is not modified (user_id=%d)", user_id)
+        else:
+            log.exception("BadRequest in callback_handler for user %d", user_id)
+            try:
+                await query.edit_message_text(
+                    "❌ Something went wrong. Tap /start to return.",
+                    reply_markup=InlineKeyboardMarkup([[_back_button()]]),
+                )
+            except Exception:
+                pass
+    except Exception:
+        log.exception("Unhandled error in callback_handler for user %d", user_id)
+        try:
+            await query.edit_message_text(
+                "❌ Something went wrong. Tap /start to return.",
+                reply_markup=InlineKeyboardMarkup([[_back_button()]]),
+            )
+        except Exception:
+            pass
+
+
+async def _route_callback(query: Any, user_id: int, role: str | None, data: str) -> None:  # noqa: C901
+    """Inner dispatch – separated so the caller can catch exceptions."""
 
     # Keep state during active input flows.
     keep = ("acc_add", "skip_phone", "ch_add", "em_add", "adm_add", "set_role", "cancel")
@@ -334,8 +428,13 @@ async def callback_handler(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> N
             accs = db.get_all_accounts()
             title = "📱 *Accounts* _(read-only)_"
 
+        if accs:
+            body = f"Select an account{' or add a new one' if can_manage else ''}:"
+        else:
+            body = "_No accounts registered yet._"
+
         await query.edit_message_text(
-            f"{title}\n\nSelect an account{' or add a new one' if can_manage else ''}:",
+            f"{title}\n\n{body}",
             reply_markup=_accounts_kb(accs, can_add=can_manage),
             parse_mode="Markdown",
         )
@@ -449,8 +548,12 @@ async def callback_handler(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> N
     # ─── Channels ──────────────────────────────────────────────── #
     elif data == "channels":
         channels = db.get_channels()
+        if channels:
+            body = "Select a channel or add a new one:"
+        else:
+            body = "_No target channels yet._ Tap ➕ to add one."
         await query.edit_message_text(
-            "📡 *Target Channels*\n\nSelect a channel or add a new one:",
+            f"📡 *Target Channels*\n\n{body}",
             reply_markup=_channels_kb(channels),
             parse_mode="Markdown",
         )
@@ -503,8 +606,12 @@ async def callback_handler(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> N
     # ─── Emojis ────────────────────────────────────────────────── #
     elif data == "emojis":
         emojis = db.get_emojis()
+        if emojis:
+            body = "Tap an emoji to remove it, or add a new one:"
+        else:
+            body = "_No emojis configured yet._ Tap ➕ to add one."
         await query.edit_message_text(
-            "😀 *Allowed Emojis*\n\nTap an emoji to remove it, or add a new one:",
+            f"😀 *Allowed Emojis*\n\n{body}",
             reply_markup=_emojis_kb(emojis),
             parse_mode="Markdown",
         )
@@ -544,10 +651,15 @@ async def callback_handler(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> N
             await query.answer("⛔ Owner only", show_alert=True)
             return
         roles = db.get_user_roles()
+        if roles:
+            body = (
+                "🛡️ Admin — accounts, channels, emojis\n"
+                "👁️ Moderator — channels, emojis, view accounts\n"
+            )
+        else:
+            body = "_No users added yet._ Tap ➕ to add one."
         await query.edit_message_text(
-            "👑 *User Role Management*\n\n"
-            "🛡️ Admin — accounts, channels, emojis\n"
-            "👁️ Moderator — channels, emojis, view accounts\n",
+            f"👑 *User Role Management*\n\n{body}",
             reply_markup=_admins_kb(roles),
             parse_mode="Markdown",
         )
@@ -670,6 +782,22 @@ async def text_handler(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
 
+    try:
+        await _route_text(msg, user_id, state)
+    except Exception:
+        log.exception("Unhandled error in text_handler for user %d", user_id)
+        user_states.pop(user_id, None)
+        try:
+            await msg.reply_text(
+                "❌ Something went wrong. Tap /start to return.",
+                reply_markup=InlineKeyboardMarkup([[_back_button()]]),
+            )
+        except Exception:
+            pass
+
+
+async def _route_text(msg: Any, user_id: int, state: dict) -> None:  # noqa: C901
+    """Inner dispatch – separated so the caller can catch exceptions."""
     step = state["step"]
     text = msg.text or ""
 
@@ -763,6 +891,7 @@ async def text_handler(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
             )
         except Exception as e:
             log.exception("Failed to save account")
+            user_states.pop(user_id, None)
             await msg.reply_text(
                 f"❌ Failed to save: `{e}`",
                 reply_markup=InlineKeyboardMarkup([[_back_button("accounts")]]),
@@ -889,5 +1018,6 @@ def setup_handlers(app: Application, database: Database, react: Reactor) -> None
     reactor = react
 
     app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("addadmin", cmd_addadmin))
     app.add_handler(CallbackQueryHandler(callback_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))

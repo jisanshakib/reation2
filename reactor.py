@@ -1,6 +1,13 @@
-"""Auto-Reaction Engine (v3) – fully non-blocking, with peer caching,
+"""Auto-Reaction Engine (v4) – fully non-blocking, with peer caching,
 per-account flood-cooldown tracking, fire-and-forget reaction sweeps,
 and periodic account-health monitoring with owner alerts.
+
+v4 changes
+──────────
+• Graceful handling when 0 clients are connected (no crash, clear logs).
+• ``_health_check_loop`` properly re-raises ``CancelledError``.
+• Early exit in ``_run_health_check`` when there are no clients.
+• ``start()`` logs a clear warning when 0 active accounts are found.
 """
 
 from __future__ import annotations
@@ -103,13 +110,20 @@ class Reactor:
         await self.reload_emojis()
 
         accounts = self.db.get_active_accounts()
-        results = await asyncio.gather(
-            *(self._safe_add_client(acc) for acc in accounts),
-            return_exceptions=True,
-        )
-        for acc, res in zip(accounts, results):
-            if isinstance(res, Exception):
-                log.error("Startup connect failed for %s: %s", acc["name"], res)
+
+        if not accounts:
+            log.warning(
+                "No active accounts found in the database. "
+                "The reactor will idle until accounts are added via the bot UI."
+            )
+        else:
+            results = await asyncio.gather(
+                *(self._safe_add_client(acc) for acc in accounts),
+                return_exceptions=True,
+            )
+            for acc, res in zip(accounts, results):
+                if isinstance(res, Exception):
+                    log.error("Startup connect failed for %s: %s", acc["name"], res)
 
         # Launch the periodic health-check loop.
         self._health_task = asyncio.create_task(self._health_check_loop())
@@ -237,18 +251,26 @@ class Reactor:
 
     async def _health_check_loop(self) -> None:
         """Runs forever, checking every ``_health_interval`` seconds."""
-        while True:
-            await asyncio.sleep(self._health_interval)
-            try:
-                await self._run_health_check()
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                log.exception("Health-check iteration failed")
+        try:
+            while True:
+                await asyncio.sleep(self._health_interval)
+                try:
+                    await self._run_health_check()
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    log.exception("Health-check iteration failed")
+        except asyncio.CancelledError:
+            log.debug("Health-check loop cancelled.")
+            raise
 
     async def _run_health_check(self) -> None:
         """Probe each connected client and try to reconnect DB-active but
         disconnected accounts."""
+        if not self.clients:
+            log.info("Health check – no clients to probe, skipping.")
+            return
+
         log.info("Health check – probing %d connected clients …", len(self.clients))
 
         # 1. Probe every connected client.

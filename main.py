@@ -1,4 +1,12 @@
-"""Entry point — wire up the database, reactor, bot, and health server."""
+"""Entry point (v4) — wire up the database, reactor, bot, and health server.
+
+v4 changes
+──────────
+• Calls ``db.ensure_owner_role(PERMANENT_OWNER_ID)`` on startup so the
+  bot always has an authorised owner row in the database.
+• Logs a startup summary with counts of accounts, channels, emojis.
+• Passes ``health_interval`` from config to the Reactor.
+"""
 
 from __future__ import annotations
 
@@ -8,7 +16,14 @@ import sys
 
 from telegram.ext import Application
 
-from config import BOT_TOKEN, SUPABASE_URL, SUPABASE_KEY, PORT, HEALTH_CHECK_INTERVAL
+from config import (
+    BOT_TOKEN,
+    SUPABASE_URL,
+    SUPABASE_KEY,
+    PERMANENT_OWNER_ID,
+    PORT,
+    HEALTH_CHECK_INTERVAL,
+)
 from database import Database
 from reactor import Reactor
 from bot_handlers import setup_handlers
@@ -57,6 +72,10 @@ def main() -> None:
 
     # ---- Shared objects -------------------------------------------- #
     db = Database(SUPABASE_URL, SUPABASE_KEY)
+
+    # Bootstrap the permanent owner into users_roles (idempotent upsert).
+    db.ensure_owner_role(PERMANENT_OWNER_ID)
+
     reactor = Reactor(db, health_interval=HEALTH_CHECK_INTERVAL)
 
     # ---- Build the bot application --------------------------------- #
@@ -83,7 +102,12 @@ def main() -> None:
     app.bot_data["health_runner"] = health_runner
 
     # ---- Run the bot (blocks until Ctrl+C / SIGTERM) --------------- #
-    log.info("Starting bot polling…")
+    log.info(
+        "Starting bot polling — owner=%d, health_interval=%ds, port=%d …",
+        PERMANENT_OWNER_ID,
+        HEALTH_CHECK_INTERVAL,
+        PORT,
+    )
     app.run_polling(drop_pending_updates=True)
 
 

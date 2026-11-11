@@ -1,6 +1,13 @@
-"""Supabase database helper – CRUD for accounts, channels, emojis, and
-user roles, with a lightweight in-memory TTL cache to eliminate response
-lag on hot-path reads (channels, emojis, role lookups).
+"""Supabase database helper (v4) – CRUD for accounts, channels, emojis,
+and user roles, with a lightweight in-memory TTL cache to eliminate
+response lag on hot-path reads (channels, emojis, role lookups).
+
+v4 changes
+──────────
+• ``ensure_owner_role()`` – upserts the permanent owner row on every
+  startup so the bot never boots without an authorised user.
+• All public methods wrapped in try/except with logging so callers
+  never see unhandled DB exceptions.
 """
 
 from __future__ import annotations
@@ -58,6 +65,35 @@ class Database:
         self._cache = _TTLCache(default_ttl=30.0)
 
     # ================================================================ #
+    #  Owner bootstrap (v4)                                            #
+    # ================================================================ #
+
+    def ensure_owner_role(self, owner_id: int) -> None:
+        """Upsert the permanent owner into ``users_roles`` so the bot
+        always has at least one authorised user after startup.
+
+        Uses ``on_conflict="user_id"`` — if the row already exists the
+        role is silently updated to ``'owner'`` (idempotent).
+        """
+        try:
+            self.client.table("users_roles").upsert(
+                {
+                    "user_id": owner_id,
+                    "role": "owner",
+                    "added_by": owner_id,
+                },
+                on_conflict="user_id",
+            ).execute()
+            self._cache.invalidate(*self._ROLE_CACHE_KEYS)
+            log.info("Owner role ensured for user %d.", owner_id)
+        except Exception:
+            log.exception(
+                "Failed to upsert owner role for %d – the bot will "
+                "still recognise this ID via the hardcoded check.",
+                owner_id,
+            )
+
+    # ================================================================ #
     #  Accounts                                                        #
     # ================================================================ #
 
@@ -85,51 +121,73 @@ class Database:
 
     def get_accounts(self, owner_id: int | None = None) -> list[dict[str, Any]]:
         """Return all accounts, optionally filtered by *owner_id*."""
-        q = self.client.table("accounts").select("*").order("created_at")
-        if owner_id is not None:
-            q = q.eq("owner_id", owner_id)
-        return q.execute().data
+        try:
+            q = self.client.table("accounts").select("*").order("created_at")
+            if owner_id is not None:
+                q = q.eq("owner_id", owner_id)
+            return q.execute().data
+        except Exception:
+            log.exception("get_accounts failed")
+            return []
 
     def get_all_accounts(self) -> list[dict[str, Any]]:
         """Return every account (all owners)."""
-        return (
-            self.client.table("accounts")
-            .select("*")
-            .order("created_at")
-            .execute()
-            .data
-        )
+        try:
+            return (
+                self.client.table("accounts")
+                .select("*")
+                .order("created_at")
+                .execute()
+                .data
+            )
+        except Exception:
+            log.exception("get_all_accounts failed")
+            return []
 
     def get_account(self, account_id: str) -> dict[str, Any] | None:
         """Return a single account by UUID, or ``None``."""
-        res = (
-            self.client.table("accounts")
-            .select("*")
-            .eq("id", account_id)
-            .execute()
-        )
-        return res.data[0] if res.data else None
+        try:
+            res = (
+                self.client.table("accounts")
+                .select("*")
+                .eq("id", account_id)
+                .execute()
+            )
+            return res.data[0] if res.data else None
+        except Exception:
+            log.exception("get_account failed for %s", account_id)
+            return None
 
     def get_active_accounts(self) -> list[dict[str, Any]]:
         """Return only accounts with status ``'active'``."""
-        return (
-            self.client.table("accounts")
-            .select("*")
-            .eq("status", "active")
-            .execute()
-            .data
-        )
+        try:
+            return (
+                self.client.table("accounts")
+                .select("*")
+                .eq("status", "active")
+                .execute()
+                .data
+            )
+        except Exception:
+            log.exception("get_active_accounts failed")
+            return []
 
     def update_account_status(self, account_id: str, status: str) -> None:
-        (
-            self.client.table("accounts")
-            .update({"status": status})
-            .eq("id", account_id)
-            .execute()
-        )
+        try:
+            (
+                self.client.table("accounts")
+                .update({"status": status})
+                .eq("id", account_id)
+                .execute()
+            )
+        except Exception:
+            log.exception("update_account_status failed for %s", account_id)
 
     def delete_account(self, account_id: str) -> None:
-        self.client.table("accounts").delete().eq("id", account_id).execute()
+        try:
+            self.client.table("accounts").delete().eq("id", account_id).execute()
+        except Exception:
+            log.exception("delete_account failed for %s", account_id)
 
     # ================================================================ #
     #  Channels  (cached)                                              #
@@ -151,28 +209,39 @@ class Database:
         cached = self._cache.get("channels")
         if cached is not None:
             return cached
-        rows = (
-            self.client.table("channels")
-            .select("*")
-            .order("created_at")
-            .execute()
-            .data
-        )
+        try:
+            rows = (
+                self.client.table("channels")
+                .select("*")
+                .order("created_at")
+                .execute()
+                .data
+            )
+        except Exception:
+            log.exception("get_channels failed")
+            return []
         self._cache.set("channels", rows)
         return rows
 
     def get_channel(self, channel_db_id: str) -> dict[str, Any] | None:
-        res = (
-            self.client.table("channels")
-            .select("*")
-            .eq("id", channel_db_id)
-            .execute()
-        )
-        return res.data[0] if res.data else None
+        try:
+            res = (
+                self.client.table("channels")
+                .select("*")
+                .eq("id", channel_db_id)
+                .execute()
+            )
+            return res.data[0] if res.data else None
+        except Exception:
+            log.exception("get_channel failed for %s", channel_db_id)
+            return None
 
     def delete_channel(self, channel_db_id: str) -> None:
-        self.client.table("channels").delete().eq("id", channel_db_id).execute()
-        self._cache.invalidate("channels")
+        try:
+            self.client.table("channels").delete().eq("id", channel_db_id).execute()
+            self._cache.invalidate("channels")
+        except Exception:
+            log.exception("delete_channel failed for %s", channel_db_id)
 
     # ================================================================ #
     #  Emojis  (cached)                                                #
@@ -188,31 +257,42 @@ class Database:
         cached = self._cache.get("emojis")
         if cached is not None:
             return cached
-        rows = (
-            self.client.table("emojis")
-            .select("*")
-            .order("created_at")
-            .execute()
-            .data
-        )
+        try:
+            rows = (
+                self.client.table("emojis")
+                .select("*")
+                .order("created_at")
+                .execute()
+                .data
+            )
+        except Exception:
+            log.exception("get_emojis failed")
+            return []
         self._cache.set("emojis", rows)
         return rows
 
     def get_emoji(self, emoji_id: str) -> dict[str, Any] | None:
-        res = (
-            self.client.table("emojis")
-            .select("*")
-            .eq("id", emoji_id)
-            .execute()
-        )
-        return res.data[0] if res.data else None
+        try:
+            res = (
+                self.client.table("emojis")
+                .select("*")
+                .eq("id", emoji_id)
+                .execute()
+            )
+            return res.data[0] if res.data else None
+        except Exception:
+            log.exception("get_emoji failed for %s", emoji_id)
+            return None
 
     def delete_emoji(self, emoji_id: str) -> None:
-        self.client.table("emojis").delete().eq("id", emoji_id).execute()
-        self._cache.invalidate("emojis")
+        try:
+            self.client.table("emojis").delete().eq("id", emoji_id).execute()
+            self._cache.invalidate("emojis")
+        except Exception:
+            log.exception("delete_emoji failed for %s", emoji_id)
 
     # ================================================================ #
-    #  User roles  (cached, multi-tier: admin / moderator)             #
+    #  User roles  (cached, multi-tier: owner / admin / moderator)     #
     # ================================================================ #
 
     _ROLE_CACHE_KEYS = ("user_roles", "authorized_ids")
@@ -228,35 +308,43 @@ class Database:
         cached = self._cache.get("user_roles")
         if cached is not None:
             return cached
-        rows = (
-            self.client.table("users_roles")
-            .select("*")
-            .order("created_at")
-            .execute()
-            .data
-        )
+        try:
+            rows = (
+                self.client.table("users_roles")
+                .select("*")
+                .order("created_at")
+                .execute()
+                .data
+            )
+        except Exception:
+            log.exception("get_user_roles failed")
+            return []
         self._cache.set("user_roles", rows)
         return rows
 
     def get_user_role(self, role_id: str) -> dict[str, Any] | None:
-        res = (
-            self.client.table("users_roles")
-            .select("*")
-            .eq("id", role_id)
-            .execute()
-        )
-        return res.data[0] if res.data else None
+        try:
+            res = (
+                self.client.table("users_roles")
+                .select("*")
+                .eq("id", role_id)
+                .execute()
+            )
+            return res.data[0] if res.data else None
+        except Exception:
+            log.exception("get_user_role failed for %s", role_id)
+            return None
 
     def get_role_for_user(self, user_id: int) -> str | None:
-        """Return the role string ('admin' or 'moderator') for a user,
-        or ``None`` if the user has no role."""
+        """Return the role string ('owner', 'admin' or 'moderator') for
+        a user, or ``None`` if the user has no role."""
         for r in self.get_user_roles():
             if int(r["user_id"]) == user_id:
                 return r["role"]
         return None
 
     def get_authorized_ids(self) -> set[int]:
-        """Return a cached set of ALL authorised user-IDs (admin + moderator)."""
+        """Return a cached set of ALL authorised user-IDs."""
         cached = self._cache.get("authorized_ids")
         if cached is not None:
             return cached
@@ -266,9 +354,15 @@ class Database:
         return ids
 
     def delete_user_role(self, role_id: str) -> None:
-        self.client.table("users_roles").delete().eq("id", role_id).execute()
-        self._cache.invalidate(*self._ROLE_CACHE_KEYS)
+        try:
+            self.client.table("users_roles").delete().eq("id", role_id).execute()
+            self._cache.invalidate(*self._ROLE_CACHE_KEYS)
+        except Exception:
+            log.exception("delete_user_role failed for %s", role_id)
 
     def delete_user_role_by_user_id(self, user_id: int) -> None:
-        self.client.table("users_roles").delete().eq("user_id", user_id).execute()
-        self._cache.invalidate(*self._ROLE_CACHE_KEYS)
+        try:
+            self.client.table("users_roles").delete().eq("user_id", user_id).execute()
+            self._cache.invalidate(*self._ROLE_CACHE_KEYS)
+        except Exception:
+            log.exception("delete_user_role_by_user_id failed for %d", user_id)
