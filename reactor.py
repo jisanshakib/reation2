@@ -1,31 +1,29 @@
-"""Auto-Reaction Engine (v7) – Master-Worker architecture.
+"""Auto-Reaction Engine (v8) – Guaranteed Multi-Account Delivery.
 
 Only the **Master Account** monitors target channels (event listener +
-fast 7-second fallback poll).  When a new post is detected the master
+fast 15-second fallback poll).  When a new post is detected the master
 dispatches reactions across ALL connected accounts (master + workers).
 Worker accounts stay idle until dispatched — no event handlers, no
 catch_up — which minimises Telegram rate-limit exposure.
 
-v7 changes
+v8 changes
 ──────────
-• **Master-Worker split**: one account is designated ``is_master``
-  in the database.  ``start()`` reads this, stores ``self.master_id``,
-  and only the master gets a NewMessage event handler + catch_up.
-• **Fallback poll loop**: ``_master_poll_loop()`` runs every 15 s on
-  the master client, calling ``get_messages`` on each target channel
-  so new posts are never missed even if the event handler stalls.
-  Uses a per-channel ``_last_seen`` dict for fast comparison.
-• **Entity pre-caching**: ``_prime_master_channels()`` calls
-  ``get_dialogs()`` and ``get_entity()`` for every target channel on
-  startup and whenever channels change, so Telethon's internal cache
-  is populated and update subscriptions are established.
-• **Auto-join**: ``auto_join_channel()`` makes the master (or any
-  available client) join a channel automatically when it is added.
-  Supports public channels and private invite links.
-• **reload_master()**: hot-swap the master at runtime from the bot UI
-  without restarting the process.
-• ``_get_any_client()`` now prefers the master client.
-• Keepalive loop prioritises master reconnection.
+• **Guaranteed delivery**: ``_sweep_reactions`` now tracks per-account
+  success/failure.  Failed accounts are retried with exponential
+  backoff (5 → 10 → 20 → … capped at 60 s) until every active account
+  has reacted, up to ``_MAX_SWEEP_RETRIES`` rounds (default 10).
+  The task stays alive on the ``asyncio.Queue`` until 100 %% delivery
+  or the retry limit is exhausted.
+• Fatal errors (``AuthKeyUnregistered``, ``UserDeactivatedBan``) and
+  permanent channel errors (``ChannelPrivate``, ``ChatWriteForbidden``,
+  ``PeerIdInvalid``) are not retried — the account/channel is marked
+  and skipped.
+• Sweep summary log now includes per-account outcome.
+
+v7 changes (preserved)
+──────────────────────
+• Master-Worker split, fallback poll loop, entity pre-caching,
+  auto-join, reload_master, keepalive priority.
 
 Preserved from v6
 ──────────────────
@@ -76,6 +74,18 @@ _MAX_PROCESSED = 10_000
 
 # Upper bound on concurrent reaction-sweep tasks.
 _MAX_CONCURRENT_SWEEPS = 5
+
+# Maximum retry rounds per sweep before giving up.
+_MAX_SWEEP_RETRIES = 10
+
+# Maximum transient-failure attempts per account per post before the
+# account is auto-deactivated (circuit breaker).
+_MAX_ACCOUNT_ATTEMPTS = 3
+
+# Initial backoff (seconds) between retry rounds; doubles each round,
+# capped at _MAX_RETRY_BACKOFF.
+_INITIAL_RETRY_BACKOFF = 5.0
+_MAX_RETRY_BACKOFF = 60.0
 
 # Timeout (seconds) for a single Telethon RPC call.
 _RPC_TIMEOUT = 15.0
@@ -1000,8 +1010,22 @@ class Reactor:
         task.add_done_callback(self._bg_tasks.discard)
 
     async def _sweep_reactions(self, chat_id: int, msg_id: int) -> None:
-        """React to a post across all connected accounts with emoji
-        fallback: if the first emoji fails, try the next, and so on."""
+        """React to a post across all connected accounts with guaranteed
+        multi-account delivery and per-account circuit breaker.
+
+        Tracks per-account success/failure with an attempt counter.
+        Failed accounts (due to network timeout, temporary FloodWait,
+        or connection drop) are retried with exponential backoff.
+
+        Circuit breaker: if an account hits ``_MAX_ACCOUNT_ATTEMPTS``
+        transient failures for this post, it is auto-marked as 'failed'
+        in the database, disconnected, and an alert is sent to the admin.
+        This prevents the queue from getting stuck on a broken account.
+
+        Fatal errors (session revoked, account banned) and permanent
+        channel errors (private/forbidden/invalid-peer) trip the breaker
+        immediately on the first occurrence.
+        """
         async with self._sweep_sem:
             log.info(
                 "Sweep %s/%s – %d accounts, %d emojis",
@@ -1011,70 +1035,249 @@ class Reactor:
                 len(self.allowed_emojis),
             )
 
-            for acc_id, client in list(self.clients.items()):
-                # Cooldown check.
-                cooldown_until = self._cooldowns.get(acc_id, 0)
-                now = time.monotonic()
-                if now < cooldown_until:
-                    wait = cooldown_until - now
-                    log.debug("Account %s in cooldown for %.1fs", acc_id[:8], wait)
-                    await asyncio.sleep(wait)
+            # Per-account attempt counter for transient failures.
+            attempt_counts: dict[str, int] = {}
 
-                acc_label = acc_id[:8]
+            # Build the list of account IDs that need to react.
+            pending: set[str] = set(self.clients.keys())
+            succeeded: set[str] = set()
+            permanently_failed: set[str] = set()
+            circuit_broken: set[str] = set()  # auto-deactivated accounts
+            retry_round = 0
+            backoff = _INITIAL_RETRY_BACKOFF
 
-                try:
-                    peer = await self._resolve_peer(acc_id, client, chat_id)
-
-                    result = await self._try_react_with_fallback(
-                        client=client,
-                        peer=peer,
-                        msg_id=msg_id,
-                        emojis=self.allowed_emojis,
-                        acc_label=acc_label,
-                    )
-                    if result is None:
-                        log.warning(
-                            "Sweep: %s failed all emojis for %s/%s",
-                            acc_label,
-                            chat_id,
-                            msg_id,
-                        )
-
-                except FloodWaitError as e:
-                    self._cooldowns[acc_id] = time.monotonic() + e.seconds
-                    log.warning(
-                        "FloodWait %ds for %s – cooldown set",
-                        e.seconds,
-                        acc_label,
-                    )
-
-                except _AUTH_FATAL_ERRORS as e:
-                    log.warning("Session dead for %s during sweep: %s", acc_label, e)
-                    self.db.update_account_status(acc_id, "failed")
-                    await self.remove_client(acc_id)
-                    await self._send_health_alert(acc_id, str(e))
-                    continue
-
-                except (
-                    ChannelPrivateError,
-                    ChatWriteForbiddenError,
-                    PeerIdInvalidError,
-                ) as e:
-                    log.warning("Reaction error for %s: %s", acc_label, e)
-
-                except asyncio.TimeoutError:
-                    log.warning(
-                        "RPC timeout for %s on %s/%s (peer resolve)",
-                        acc_label,
+            while pending and retry_round <= _MAX_SWEEP_RETRIES:
+                if retry_round > 0:
+                    log.info(
+                        "Sweep %s/%s retry round %d – %d accounts remaining, "
+                        "backoff %.1fs",
                         chat_id,
                         msg_id,
+                        retry_round,
+                        len(pending),
+                        backoff,
                     )
+                    await asyncio.sleep(backoff)
+                    backoff = min(backoff * 2, _MAX_RETRY_BACKOFF)
 
-                except Exception:
-                    log.exception("Unexpected error for %s", acc_label)
+                round_targets = list(pending)
+                round_failures: set[str] = set()
 
-                # Strict 1-second delay between accounts.
-                await asyncio.sleep(1)
+                for acc_id in round_targets:
+                    client = self.clients.get(acc_id)
+                    if client is None or not client.is_connected():
+                        attempt_counts[acc_id] = attempt_counts.get(acc_id, 0) + 1
+                        if attempt_counts[acc_id] >= _MAX_ACCOUNT_ATTEMPTS:
+                            log.warning(
+                                "Circuit breaker: %s disconnected %d times "
+                                "– auto-deactivating",
+                                acc_id[:8],
+                                attempt_counts[acc_id],
+                            )
+                            self.db.update_account_status(acc_id, "failed")
+                            await self.remove_client(acc_id)
+                            await self._send_health_alert(
+                                acc_id,
+                                f"Auto-deactivated: disconnected {attempt_counts[acc_id]} "
+                                f"times during sweep {chat_id}/{msg_id}",
+                            )
+                            circuit_broken.add(acc_id)
+                        else:
+                            log.debug(
+                                "Sweep: %s not connected (attempt %d/%d), will retry.",
+                                acc_id[:8],
+                                attempt_counts[acc_id],
+                                _MAX_ACCOUNT_ATTEMPTS,
+                            )
+                            round_failures.add(acc_id)
+                        continue
+
+                    # Cooldown check.
+                    cooldown_until = self._cooldowns.get(acc_id, 0)
+                    now = time.monotonic()
+                    if now < cooldown_until:
+                        wait = cooldown_until - now
+                        log.debug(
+                            "Account %s in cooldown for %.1fs",
+                            acc_id[:8],
+                            wait,
+                        )
+                        await asyncio.sleep(wait)
+
+                    acc_label = acc_id[:8]
+
+                    try:
+                        peer = await self._resolve_peer(acc_id, client, chat_id)
+
+                        result = await self._try_react_with_fallback(
+                            client=client,
+                            peer=peer,
+                            msg_id=msg_id,
+                            emojis=self.allowed_emojis,
+                            acc_label=acc_label,
+                        )
+                        if result is not None:
+                            succeeded.add(acc_id)
+                        else:
+                            # All emojis rejected — permanent for this post.
+                            log.warning(
+                                "Sweep: %s all emojis rejected for %s/%s "
+                                "– marking permanent failure",
+                                acc_label,
+                                chat_id,
+                                msg_id,
+                            )
+                            permanently_failed.add(acc_id)
+
+                    except FloodWaitError as e:
+                        self._cooldowns[acc_id] = time.monotonic() + e.seconds
+                        attempt_counts[acc_id] = attempt_counts.get(acc_id, 0) + 1
+                        if attempt_counts[acc_id] >= _MAX_ACCOUNT_ATTEMPTS:
+                            log.warning(
+                                "Circuit breaker: %s hit %d FloodWaits "
+                                "– auto-deactivating",
+                                acc_label,
+                                attempt_counts[acc_id],
+                            )
+                            self.db.update_account_status(acc_id, "failed")
+                            await self.remove_client(acc_id)
+                            await self._send_health_alert(
+                                acc_id,
+                                f"Auto-deactivated: {attempt_counts[acc_id]} "
+                                f"FloodWait errors during sweep {chat_id}/{msg_id}",
+                            )
+                            circuit_broken.add(acc_id)
+                        else:
+                            log.warning(
+                                "FloodWait %ds for %s (attempt %d/%d) – will retry",
+                                e.seconds,
+                                acc_label,
+                                attempt_counts[acc_id],
+                                _MAX_ACCOUNT_ATTEMPTS,
+                            )
+                            round_failures.add(acc_id)
+
+                    except _AUTH_FATAL_ERRORS as e:
+                        log.warning(
+                            "Session dead for %s during sweep: %s",
+                            acc_label,
+                            e,
+                        )
+                        self.db.update_account_status(acc_id, "failed")
+                        await self.remove_client(acc_id)
+                        await self._send_health_alert(acc_id, str(e))
+                        permanently_failed.add(acc_id)
+
+                    except (
+                        ChannelPrivateError,
+                        ChatWriteForbiddenError,
+                        PeerIdInvalidError,
+                    ) as e:
+                        log.warning(
+                            "Permanent channel error for %s: %s – "
+                            "skipping retries",
+                            acc_label,
+                            e,
+                        )
+                        permanently_failed.add(acc_id)
+
+                    except (asyncio.TimeoutError, ConnectionError, OSError) as e:
+                        attempt_counts[acc_id] = attempt_counts.get(acc_id, 0) + 1
+                        if attempt_counts[acc_id] >= _MAX_ACCOUNT_ATTEMPTS:
+                            log.warning(
+                                "Circuit breaker: %s hit %d transient errors "
+                                "– auto-deactivating",
+                                acc_label,
+                                attempt_counts[acc_id],
+                            )
+                            self.db.update_account_status(acc_id, "failed")
+                            await self.remove_client(acc_id)
+                            await self._send_health_alert(
+                                acc_id,
+                                f"Auto-deactivated: {attempt_counts[acc_id]} transient "
+                                f"errors ({type(e).__name__}) during sweep "
+                                f"{chat_id}/{msg_id}",
+                            )
+                            circuit_broken.add(acc_id)
+                        else:
+                            log.warning(
+                                "Transient error for %s on %s/%s: %s "
+                                "(attempt %d/%d) – will retry",
+                                acc_label,
+                                chat_id,
+                                msg_id,
+                                e,
+                                attempt_counts[acc_id],
+                                _MAX_ACCOUNT_ATTEMPTS,
+                            )
+                            round_failures.add(acc_id)
+
+                    except Exception:
+                        attempt_counts[acc_id] = attempt_counts.get(acc_id, 0) + 1
+                        if attempt_counts[acc_id] >= _MAX_ACCOUNT_ATTEMPTS:
+                            log.warning(
+                                "Circuit breaker: %s hit %d unexpected errors "
+                                "– auto-deactivating",
+                                acc_id[:8],
+                                attempt_counts[acc_id],
+                            )
+                            self.db.update_account_status(acc_id, "failed")
+                            await self.remove_client(acc_id)
+                            await self._send_health_alert(
+                                acc_id,
+                                f"Auto-deactivated: {attempt_counts[acc_id]} unexpected "
+                                f"errors during sweep {chat_id}/{msg_id}",
+                            )
+                            circuit_broken.add(acc_id)
+                        else:
+                            log.exception(
+                                "Unexpected error for %s (attempt %d/%d) "
+                                "– will retry",
+                                acc_id[:8],
+                                attempt_counts[acc_id],
+                                _MAX_ACCOUNT_ATTEMPTS,
+                            )
+                            round_failures.add(acc_id)
+
+                    # 1-second delay between accounts.
+                    await asyncio.sleep(1)
+
+                # Update the pending set for the next round.
+                excluded = succeeded | permanently_failed | circuit_broken
+                pending = round_failures - excluded
+                retry_round += 1
+
+            # ── Sweep summary ────────────────────────────────────────
+            total = (
+                len(succeeded) + len(permanently_failed)
+                + len(circuit_broken) + len(pending)
+            )
+            if pending:
+                log.warning(
+                    "Sweep %s/%s INCOMPLETE after %d retries – "
+                    "succeeded=%d, permanent_fail=%d, circuit_broken=%d, "
+                    "still_pending=%d",
+                    chat_id,
+                    msg_id,
+                    _MAX_SWEEP_RETRIES,
+                    len(succeeded),
+                    len(permanently_failed),
+                    len(circuit_broken),
+                    len(pending),
+                )
+            else:
+                log.info(
+                    "Sweep %s/%s COMPLETE – succeeded=%d, "
+                    "permanent_fail=%d, circuit_broken=%d "
+                    "(total=%d, retries=%d)",
+                    chat_id,
+                    msg_id,
+                    len(succeeded),
+                    len(permanently_failed),
+                    len(circuit_broken),
+                    total,
+                    max(0, retry_round - 1),
+                )
 
     async def _resolve_peer(
         self, acc_id: str, client: TelegramClient, chat_id: int | str
@@ -1144,7 +1347,7 @@ class Reactor:
 
     async def instant_react(self, post_link: str) -> str:
         """Parse a Telegram post link, then trigger ALL active/connected
-        accounts to react to it with emoji fallback.
+        accounts to react with guaranteed delivery + circuit breaker.
 
         The channel does NOT need to be in the target-channels list.
         Returns a human-readable status summary.
@@ -1162,92 +1365,207 @@ class Reactor:
         if not self.allowed_emojis:
             return "❌ No reaction emojis configured. Add emojis first."
 
-        success = 0
-        failed = 0
-        errors: list[str] = []
+        attempt_counts: dict[str, int] = {}
+        pending: set[str] = set(self.clients.keys())
+        succeeded: set[str] = set()
+        permanently_failed: dict[str, str] = {}  # acc_id → reason
+        circuit_broken: dict[str, str] = {}      # acc_id → reason
+        retry_round = 0
+        backoff = _INITIAL_RETRY_BACKOFF
 
-        for acc_id, client in list(self.clients.items()):
-            cooldown_until = self._cooldowns.get(acc_id, 0)
-            now = time.monotonic()
-            if now < cooldown_until:
-                wait = cooldown_until - now
-                log.debug(
-                    "Instant: account %s in cooldown for %.1fs", acc_id[:8], wait
+        while pending and retry_round <= _MAX_SWEEP_RETRIES:
+            if retry_round > 0:
+                log.info(
+                    "Instant retry round %d – %d accounts remaining",
+                    retry_round,
+                    len(pending),
                 )
-                await asyncio.sleep(wait)
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, _MAX_RETRY_BACKOFF)
 
-            try:
-                if raw_id:
-                    chat_id: int | str = int(f"-100{raw_id}")
-                    peer = await asyncio.wait_for(
-                        client.get_input_entity(chat_id), timeout=_RPC_TIMEOUT
+            round_targets = list(pending)
+            round_failures: set[str] = set()
+
+            for acc_id in round_targets:
+                client = self.clients.get(acc_id)
+                if client is None or not client.is_connected():
+                    attempt_counts[acc_id] = attempt_counts.get(acc_id, 0) + 1
+                    if attempt_counts[acc_id] >= _MAX_ACCOUNT_ATTEMPTS:
+                        self.db.update_account_status(acc_id, "failed")
+                        await self.remove_client(acc_id)
+                        await self._send_health_alert(
+                            acc_id,
+                            f"Auto-deactivated: disconnected "
+                            f"{attempt_counts[acc_id]} times (instant react)",
+                        )
+                        circuit_broken[acc_id] = "Disconnected (circuit breaker)"
+                    else:
+                        round_failures.add(acc_id)
+                    continue
+
+                cooldown_until = self._cooldowns.get(acc_id, 0)
+                now = time.monotonic()
+                if now < cooldown_until:
+                    wait = cooldown_until - now
+                    log.debug(
+                        "Instant: account %s in cooldown for %.1fs",
+                        acc_id[:8],
+                        wait,
                     )
-                else:
-                    peer = await asyncio.wait_for(
-                        client.get_input_entity(username), timeout=_RPC_TIMEOUT
+                    await asyncio.sleep(wait)
+
+                try:
+                    if raw_id:
+                        chat_id: int | str = int(f"-100{raw_id}")
+                        peer = await asyncio.wait_for(
+                            client.get_input_entity(chat_id),
+                            timeout=_RPC_TIMEOUT,
+                        )
+                    else:
+                        peer = await asyncio.wait_for(
+                            client.get_input_entity(username),
+                            timeout=_RPC_TIMEOUT,
+                        )
+
+                    result = await self._try_react_with_fallback(
+                        client=client,
+                        peer=peer,
+                        msg_id=msg_id,
+                        emojis=self.allowed_emojis,
+                        acc_label=acc_id[:8],
                     )
+                    if result:
+                        log.info(
+                            "Instant: %s reacted with %s", acc_id[:8], result
+                        )
+                        succeeded.add(acc_id)
+                    else:
+                        permanently_failed[acc_id] = "All emojis rejected"
 
-                result = await self._try_react_with_fallback(
-                    client=client,
-                    peer=peer,
-                    msg_id=msg_id,
-                    emojis=self.allowed_emojis,
-                    acc_label=acc_id[:8],
-                )
-                if result:
-                    log.info("Instant: %s reacted with %s", acc_id[:8], result)
-                    success += 1
-                else:
-                    failed += 1
-                    errors.append("All emojis rejected")
+                except FloodWaitError as e:
+                    self._cooldowns[acc_id] = time.monotonic() + e.seconds
+                    attempt_counts[acc_id] = attempt_counts.get(acc_id, 0) + 1
+                    if attempt_counts[acc_id] >= _MAX_ACCOUNT_ATTEMPTS:
+                        self.db.update_account_status(acc_id, "failed")
+                        await self.remove_client(acc_id)
+                        await self._send_health_alert(
+                            acc_id,
+                            f"Auto-deactivated: {attempt_counts[acc_id]} "
+                            f"FloodWait errors (instant react)",
+                        )
+                        circuit_broken[acc_id] = "FloodWait (circuit breaker)"
+                    else:
+                        log.warning(
+                            "Instant: FloodWait %ds for %s (attempt %d/%d)",
+                            e.seconds,
+                            acc_id[:8],
+                            attempt_counts[acc_id],
+                            _MAX_ACCOUNT_ATTEMPTS,
+                        )
+                        round_failures.add(acc_id)
 
-            except FloodWaitError as e:
-                self._cooldowns[acc_id] = time.monotonic() + e.seconds
-                log.warning(
-                    "Instant: FloodWait %ds for %s", e.seconds, acc_id[:8]
-                )
-                failed += 1
-                errors.append(f"FloodWait {e.seconds}s")
+                except _AUTH_FATAL_ERRORS as e:
+                    log.warning(
+                        "Instant: session dead for %s: %s",
+                        acc_id[:8],
+                        e,
+                    )
+                    self.db.update_account_status(acc_id, "failed")
+                    await self.remove_client(acc_id)
+                    await self._send_health_alert(acc_id, str(e))
+                    permanently_failed[acc_id] = "Session revoked"
 
-            except _AUTH_FATAL_ERRORS as e:
-                log.warning("Instant: session dead for %s: %s", acc_id[:8], e)
-                self.db.update_account_status(acc_id, "failed")
-                await self.remove_client(acc_id)
-                await self._send_health_alert(acc_id, str(e))
-                failed += 1
-                errors.append("Session revoked")
-                continue
+                except (
+                    ChannelPrivateError,
+                    ChatWriteForbiddenError,
+                    PeerIdInvalidError,
+                ) as e:
+                    log.warning(
+                        "Instant: channel error for %s: %s",
+                        acc_id[:8],
+                        e,
+                    )
+                    permanently_failed[acc_id] = str(e)
 
-            except (
-                ChannelPrivateError,
-                ChatWriteForbiddenError,
-                PeerIdInvalidError,
-            ) as e:
-                log.warning("Instant: reaction error for %s: %s", acc_id[:8], e)
-                failed += 1
-                errors.append(str(e))
+                except (asyncio.TimeoutError, ConnectionError, OSError) as e:
+                    attempt_counts[acc_id] = attempt_counts.get(acc_id, 0) + 1
+                    if attempt_counts[acc_id] >= _MAX_ACCOUNT_ATTEMPTS:
+                        self.db.update_account_status(acc_id, "failed")
+                        await self.remove_client(acc_id)
+                        await self._send_health_alert(
+                            acc_id,
+                            f"Auto-deactivated: {attempt_counts[acc_id]} "
+                            f"transient errors (instant react)",
+                        )
+                        circuit_broken[acc_id] = f"{type(e).__name__} (circuit breaker)"
+                    else:
+                        log.warning(
+                            "Instant: transient error for %s: %s "
+                            "(attempt %d/%d) – will retry",
+                            acc_id[:8],
+                            e,
+                            attempt_counts[acc_id],
+                            _MAX_ACCOUNT_ATTEMPTS,
+                        )
+                        round_failures.add(acc_id)
 
-            except asyncio.TimeoutError:
-                log.warning("Instant: timeout for %s", acc_id[:8])
-                failed += 1
-                errors.append("Timeout")
+                except Exception as e:
+                    attempt_counts[acc_id] = attempt_counts.get(acc_id, 0) + 1
+                    if attempt_counts[acc_id] >= _MAX_ACCOUNT_ATTEMPTS:
+                        self.db.update_account_status(acc_id, "failed")
+                        await self.remove_client(acc_id)
+                        await self._send_health_alert(
+                            acc_id,
+                            f"Auto-deactivated: {attempt_counts[acc_id]} "
+                            f"unexpected errors (instant react)",
+                        )
+                        circuit_broken[acc_id] = f"{type(e).__name__} (circuit breaker)"
+                    else:
+                        log.exception(
+                            "Instant: unexpected error for %s "
+                            "(attempt %d/%d) – will retry",
+                            acc_id[:8],
+                            attempt_counts[acc_id],
+                            _MAX_ACCOUNT_ATTEMPTS,
+                        )
+                        round_failures.add(acc_id)
 
-            except Exception as e:
-                log.exception("Instant: unexpected error for %s", acc_id[:8])
-                failed += 1
-                errors.append(str(e))
+                # 1-second delay between accounts.
+                await asyncio.sleep(1)
 
-            # 1-second delay between accounts.
-            await asyncio.sleep(1)
+            excluded = (
+                succeeded
+                | set(permanently_failed.keys())
+                | set(circuit_broken.keys())
+            )
+            pending = round_failures - excluded
+            retry_round += 1
 
         # Build summary.
+        total_failed = len(permanently_failed) + len(circuit_broken)
         lines = ["⚡ *Instant Reaction Complete*\n"]
-        lines.append(f"✅ Success: {success}  |  ❌ Failed: {failed}")
-        if errors:
-            unique = list(dict.fromkeys(errors))[:5]
-            lines.append("\n*Errors:*")
-            for err in unique:
+        lines.append(
+            f"✅ Success: {len(succeeded)}  |  "
+            f"❌ Failed: {total_failed}  |  "
+            f"⏳ Pending: {len(pending)}"
+        )
+        retries_used = max(0, retry_round - 1)
+        if retries_used > 0:
+            lines.append(f"🔄 Retry rounds used: {retries_used}")
+        if circuit_broken:
+            lines.append(f"\n🔌 *Circuit Breaker ({len(circuit_broken)}):*")
+            for reason in list(dict.fromkeys(circuit_broken.values()))[:3]:
+                lines.append(f"• `{reason}`")
+        if permanently_failed:
+            unique_errors = list(dict.fromkeys(permanently_failed.values()))[:5]
+            lines.append("\n*Permanent Errors:*")
+            for err in unique_errors:
                 lines.append(f"• `{err}`")
+        if pending:
+            lines.append(
+                f"\n⚠️ {len(pending)} account(s) still failed after "
+                f"{_MAX_SWEEP_RETRIES} retries."
+            )
         return "\n".join(lines)
 
     # ================================================================ #
