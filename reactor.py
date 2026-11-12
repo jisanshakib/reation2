@@ -56,7 +56,7 @@ from telethon.errors import (
     UserDeactivatedBanError,
 )
 from telethon.sessions import StringSession
-from telethon.tl.functions.channels import JoinChannelRequest
+from telethon.tl.functions.channels import JoinChannelRequest, LeaveChannelRequest
 from telethon.tl.functions.messages import (
     ImportChatInviteRequest,
     SendReactionRequest,
@@ -644,6 +644,162 @@ class Reactor:
             )
 
     # ================================================================ #
+    #  All-account join / leave                                         #
+    # ================================================================ #
+
+    async def _join_client_to_channel(
+        self, acc_id: str, client: TelegramClient, channel_entity: int | str
+    ) -> None:
+        """Make a single client join a channel. Best-effort, non-fatal."""
+        try:
+            entity = await asyncio.wait_for(
+                client.get_entity(channel_entity), timeout=_RPC_TIMEOUT
+            )
+            await asyncio.wait_for(
+                client(JoinChannelRequest(channel=entity)),
+                timeout=_RPC_TIMEOUT,
+            )
+            log.debug("Account %s joined channel %s", acc_id[:8], channel_entity)
+        except Exception as e:
+            log.debug(
+                "Account %s failed to join %s: %s", acc_id[:8], channel_entity, e
+            )
+
+    async def auto_join_all_accounts(self, channel_entity: int | str) -> None:
+        """Make ALL connected accounts (master + workers) join a channel."""
+        for acc_id, client in list(self.clients.items()):
+            if not client.is_connected():
+                continue
+            await self._join_client_to_channel(acc_id, client, channel_entity)
+            await asyncio.sleep(0.5)  # light stagger to avoid flood
+
+    async def auto_leave_channel(self, channel_entity: int | str) -> None:
+        """Make ALL connected accounts leave a channel."""
+        for acc_id, client in list(self.clients.items()):
+            if not client.is_connected():
+                continue
+            try:
+                entity = await asyncio.wait_for(
+                    client.get_entity(channel_entity), timeout=_RPC_TIMEOUT
+                )
+                await asyncio.wait_for(
+                    client(LeaveChannelRequest(channel=entity)),
+                    timeout=_RPC_TIMEOUT,
+                )
+                log.debug("Account %s left channel %s", acc_id[:8], channel_entity)
+            except Exception as e:
+                log.debug(
+                    "Account %s failed to leave %s: %s",
+                    acc_id[:8], channel_entity, e,
+                )
+            await asyncio.sleep(0.5)
+
+    async def _leave_workers_from_channel(self, channel_entity: int | str) -> None:
+        """Make only WORKER accounts leave a channel (master stays)."""
+        for acc_id, client in list(self.clients.items()):
+            if acc_id == self.master_id:
+                continue  # master stays for monitoring
+            if not client.is_connected():
+                continue
+            try:
+                entity = await asyncio.wait_for(
+                    client.get_entity(channel_entity), timeout=_RPC_TIMEOUT
+                )
+                await asyncio.wait_for(
+                    client(LeaveChannelRequest(channel=entity)),
+                    timeout=_RPC_TIMEOUT,
+                )
+                log.debug("Worker %s left channel %s post-reaction", acc_id[:8], channel_entity)
+            except Exception as e:
+                log.debug(
+                    "Worker %s failed to leave %s: %s",
+                    acc_id[:8], channel_entity, e,
+                )
+            await asyncio.sleep(0.5)
+
+    # ================================================================ #
+    #  Auto-rebind (background session recovery)                        #
+    # ================================================================ #
+
+    async def _try_auto_rebind(self, acc_id: str) -> bool:
+        """Attempt to reconnect a failed account using its stored session.
+
+        Returns ``True`` if the session is still valid and the client
+        was reconnected successfully.  Returns ``False`` if the session
+        is dead (requires manual OTP/2FA re-authentication).
+
+        This does NOT do OTP/2FA — it only tests if the existing
+        ``session_str`` still works and reconnects if so.
+        """
+        acc = self.db.get_account(acc_id)
+        if acc is None:
+            log.debug("auto_rebind: account %s not found in DB", acc_id[:8])
+            return False
+
+        if not acc.get("session_str"):
+            return False
+
+        try:
+            session = StringSession(acc["session_str"])
+            client = TelegramClient(
+                session,
+                int(acc["api_id"]),
+                acc["api_hash"],
+                receive_updates=(acc_id == self.master_id),
+            )
+            await asyncio.wait_for(client.connect(), timeout=_RPC_TIMEOUT)
+
+            if not await asyncio.wait_for(
+                client.is_user_authorized(), timeout=_RPC_TIMEOUT
+            ):
+                await client.disconnect()
+                return False
+
+            # Session is valid — disconnect the temp client and
+            # let add_client() do the full setup.
+            await client.disconnect()
+
+            # Re-add through the normal path.
+            await self.add_client(acc)
+            self.db.update_account_status(acc_id, "active")
+
+            log.info("Auto-rebind SUCCESS for %s (%s)", acc["name"], acc_id[:8])
+
+            # Notify admin.
+            await self._send_rebind_success_alert(acc)
+            return True
+
+        except _AUTH_FATAL_ERRORS:
+            log.debug("auto_rebind: session permanently dead for %s", acc_id[:8])
+            return False
+        except Exception as e:
+            log.debug("auto_rebind: failed for %s: %s", acc_id[:8], e)
+            return False
+
+    async def _send_rebind_success_alert(self, acc: dict) -> None:
+        """Notify the admin that an account was auto-recovered."""
+        if self._bot is None:
+            return
+
+        from config import PERMANENT_OWNER_ID
+
+        text = (
+            "🔄 *Auto-Rebind Success*\n\n"
+            f"• *Account:* {acc['name']}\n"
+            f"• *Issue:* Session expired / disconnected\n"
+            f"• *Status:* Successfully recovered and "
+            f"reactivated automatically!"
+        )
+        try:
+            await self._bot.send_message(
+                chat_id=PERMANENT_OWNER_ID,
+                text=text,
+                parse_mode="Markdown",
+            )
+        except Exception:
+            log.debug("Failed to send rebind success alert for %s", acc["name"])
+
+    # ================================================================ #
     #  Reload helpers                                                  #
     # ================================================================ #
 
@@ -841,15 +997,22 @@ class Reactor:
                 await asyncio.wait_for(client.get_me(), timeout=_RPC_TIMEOUT)
             except _AUTH_FATAL_ERRORS as e:
                 log.warning("Session revoked/banned for %s: %s", acc_id[:8], e)
-                self.db.update_account_status(acc_id, "failed")
                 await self.remove_client(acc_id)
+                # Try auto-rebind before giving up.
+                if await self._try_auto_rebind(acc_id):
+                    continue
+                self.db.update_account_status(acc_id, "failed")
                 await self._send_health_alert(acc_id, str(e))
             except asyncio.CancelledError:
                 raise
             except Exception as e:
                 log.warning("Health probe failed for %s: %s", acc_id[:8], e)
-                acc = self.db.get_account(acc_id)
                 await self.remove_client(acc_id)
+                # Try auto-rebind first.
+                if await self._try_auto_rebind(acc_id):
+                    continue
+                # Fall back to simple reconnect.
+                acc = self.db.get_account(acc_id)
                 if acc:
                     try:
                         await self.add_client(acc)
@@ -867,12 +1030,15 @@ class Reactor:
                     await self.add_client(acc)
                     log.info("Recovered account %s during health check.", acc["name"])
                 except _AUTH_FATAL_ERRORS as e:
-                    self.db.update_account_status(acc["id"], "failed")
-                    await self._send_health_alert(acc["id"], str(e))
+                    # Try auto-rebind before marking failed.
+                    if not await self._try_auto_rebind(acc["id"]):
+                        self.db.update_account_status(acc["id"], "failed")
+                        await self._send_health_alert(acc["id"], str(e))
                 except Exception as e:
                     log.warning("Recovery failed for %s: %s", acc["name"], e)
-                    self.db.update_account_status(acc["id"], "failed")
-                    await self._send_health_alert(acc["id"], str(e))
+                    if not await self._try_auto_rebind(acc["id"]):
+                        self.db.update_account_status(acc["id"], "failed")
+                        await self._send_health_alert(acc["id"], str(e))
 
     async def _send_health_alert(self, account_id: str, error: str) -> None:
         """Send a private DM to the Permanent Owner about a failed account."""
@@ -1011,7 +1177,13 @@ class Reactor:
 
     async def _sweep_reactions(self, chat_id: int, msg_id: int) -> None:
         """React to a post across all connected accounts with guaranteed
-        multi-account delivery and per-account circuit breaker.
+        multi-account delivery, per-account circuit breaker, and dynamic
+        join→react→leave lifecycle.
+
+        **Lifecycle**:
+        1. Pre-join: ensure every worker account is a member of the channel.
+        2. React: guaranteed delivery with retry + circuit breaker.
+        3. Post-leave: workers auto-leave the channel (master stays).
 
         Tracks per-account success/failure with an attempt counter.
         Failed accounts (due to network timeout, temporary FloodWait,
@@ -1035,6 +1207,16 @@ class Reactor:
                 len(self.allowed_emojis),
             )
 
+            # ── Step A: Pre-reaction join check ──────────────────────
+            for acc_id, client in list(self.clients.items()):
+                if acc_id == self.master_id:
+                    continue  # master already joined and monitoring
+                if not client.is_connected():
+                    continue
+                await self._join_client_to_channel(acc_id, client, chat_id)
+                await asyncio.sleep(0.3)
+
+            # ── Step B: Guaranteed reaction with retry ───────────────
             # Per-account attempt counter for transient failures.
             attempt_counts: dict[str, int] = {}
 
@@ -1082,6 +1264,10 @@ class Reactor:
                                 f"times during sweep {chat_id}/{msg_id}",
                             )
                             circuit_broken.add(acc_id)
+                            self._log_outcome(
+                                chat_id, msg_id, acc_id, "failed",
+                                f"Disconnected {attempt_counts[acc_id]}x (circuit breaker)",
+                            )
                         else:
                             log.debug(
                                 "Sweep: %s not connected (attempt %d/%d), will retry.",
@@ -1118,6 +1304,7 @@ class Reactor:
                         )
                         if result is not None:
                             succeeded.add(acc_id)
+                            self._log_outcome(chat_id, msg_id, acc_id, "success")
                         else:
                             # All emojis rejected — permanent for this post.
                             log.warning(
@@ -1128,6 +1315,10 @@ class Reactor:
                                 msg_id,
                             )
                             permanently_failed.add(acc_id)
+                            self._log_outcome(
+                                chat_id, msg_id, acc_id, "failed",
+                                "All emojis rejected",
+                            )
 
                     except FloodWaitError as e:
                         self._cooldowns[acc_id] = time.monotonic() + e.seconds
@@ -1147,6 +1338,10 @@ class Reactor:
                                 f"FloodWait errors during sweep {chat_id}/{msg_id}",
                             )
                             circuit_broken.add(acc_id)
+                            self._log_outcome(
+                                chat_id, msg_id, acc_id, "failed",
+                                f"Circuit breaker: {attempt_counts[acc_id]}x FloodWait",
+                            )
                         else:
                             log.warning(
                                 "FloodWait %ds for %s (attempt %d/%d) – will retry",
@@ -1167,6 +1362,10 @@ class Reactor:
                         await self.remove_client(acc_id)
                         await self._send_health_alert(acc_id, str(e))
                         permanently_failed.add(acc_id)
+                        self._log_outcome(
+                            chat_id, msg_id, acc_id, "failed",
+                            f"Session dead: {e}",
+                        )
 
                     except (
                         ChannelPrivateError,
@@ -1180,6 +1379,10 @@ class Reactor:
                             e,
                         )
                         permanently_failed.add(acc_id)
+                        self._log_outcome(
+                            chat_id, msg_id, acc_id, "failed",
+                            f"Channel error: {type(e).__name__}",
+                        )
 
                     except (asyncio.TimeoutError, ConnectionError, OSError) as e:
                         attempt_counts[acc_id] = attempt_counts.get(acc_id, 0) + 1
@@ -1199,6 +1402,11 @@ class Reactor:
                                 f"{chat_id}/{msg_id}",
                             )
                             circuit_broken.add(acc_id)
+                            self._log_outcome(
+                                chat_id, msg_id, acc_id, "failed",
+                                f"Circuit breaker: {attempt_counts[acc_id]}x "
+                                f"{type(e).__name__}",
+                            )
                         else:
                             log.warning(
                                 "Transient error for %s on %s/%s: %s "
@@ -1229,6 +1437,10 @@ class Reactor:
                                 f"errors during sweep {chat_id}/{msg_id}",
                             )
                             circuit_broken.add(acc_id)
+                            self._log_outcome(
+                                chat_id, msg_id, acc_id, "failed",
+                                f"Circuit breaker: {attempt_counts[acc_id]}x unexpected error",
+                            )
                         else:
                             log.exception(
                                 "Unexpected error for %s (attempt %d/%d) "
@@ -1279,6 +1491,11 @@ class Reactor:
                     max(0, retry_round - 1),
                 )
 
+            # ── Step C: Post-reaction auto-leave (workers only) ──────
+            # Master stays in the channel for continued monitoring.
+            # Workers leave to keep their channel list clean.
+            await self._leave_workers_from_channel(chat_id)
+
     async def _resolve_peer(
         self, acc_id: str, client: TelegramClient, chat_id: int | str
     ) -> object:
@@ -1291,6 +1508,44 @@ class Reactor:
         )
         self._peer_cache[key] = peer
         return peer
+
+    # ================================================================ #
+    #  Reaction logging helper                                          #
+    # ================================================================ #
+
+    def _channel_name_for(self, chat_id: int) -> str:
+        """Best-effort channel name lookup from cached DB channels."""
+        for ch in self.db.get_channels():
+            if int(ch["channel_id"]) == chat_id:
+                return ch.get("channel_name") or str(chat_id)
+        return str(chat_id)
+
+    def _account_name_for(self, acc_id: str) -> str:
+        """Best-effort account name lookup."""
+        acc = self.db.get_account(acc_id)
+        return acc["name"] if acc else acc_id[:8]
+
+    def _log_outcome(
+        self,
+        chat_id: int,
+        msg_id: int,
+        acc_id: str,
+        status: str,
+        error_message: str | None = None,
+    ) -> None:
+        """Write a reaction outcome to the ``reaction_logs`` table."""
+        try:
+            self.db.log_reaction(
+                channel_id=chat_id,
+                channel_name=self._channel_name_for(chat_id),
+                post_id=msg_id,
+                account_id=acc_id,
+                account_name=self._account_name_for(acc_id),
+                status=status,
+                error_message=error_message,
+            )
+        except Exception:
+            log.debug("_log_outcome: failed to log %s for %s", status, acc_id[:8])
 
     # ================================================================ #
     #  Check helper (bot "Check 🔍" button)                            #

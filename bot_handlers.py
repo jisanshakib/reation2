@@ -148,6 +148,7 @@ def _main_menu_kb(user_id: int) -> InlineKeyboardMarkup:
         [InlineKeyboardButton("📡 Channels", callback_data="channels")],
         [InlineKeyboardButton("😀 Emojis", callback_data="emojis")],
         [InlineKeyboardButton("⚡ Instant Reaction", callback_data="instant_react")],
+        [InlineKeyboardButton("📊 Analytics", callback_data="stats")],
     ]
     if role == "owner":
         rows.append([InlineKeyboardButton("👑 Admins", callback_data="admins")])
@@ -285,6 +286,37 @@ def _role_select_kb() -> InlineKeyboardMarkup:
     )
 
 
+# ── Analytics / Stats ──────────────────────────────────────────── #
+
+def _stats_main_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("📊 Summary", callback_data="stats_summary"),
+                InlineKeyboardButton("🛠️ Error Logs", callback_data="stats_errors"),
+            ],
+            [
+                InlineKeyboardButton("🔄 Refresh", callback_data="stats"),
+                InlineKeyboardButton("🗑️ Clear Old Logs", callback_data="stats_clear"),
+            ],
+            [_back_button()],
+        ]
+    )
+
+
+def _stats_nav_kb(current: str) -> InlineKeyboardMarkup:
+    """Navigation bar shown inside summary / error views."""
+    rows: list[list[InlineKeyboardButton]] = []
+    if current == "summary":
+        rows.append([InlineKeyboardButton("🛠️ Switch to Error Logs", callback_data="stats_errors")])
+        rows.append([InlineKeyboardButton("🔄 Refresh", callback_data="stats_summary")])
+    else:
+        rows.append([InlineKeyboardButton("📊 Switch to Summary", callback_data="stats_summary")])
+        rows.append([InlineKeyboardButton("🔄 Refresh", callback_data="stats_errors")])
+    rows.append([_back_button("stats")])
+    return InlineKeyboardMarkup(rows)
+
+
 # ── Session choice (during registration) ───────────────────────── #
 
 def _session_choice_kb() -> InlineKeyboardMarkup:
@@ -389,6 +421,36 @@ async def cmd_cancel(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
     user_states.pop(user_id, None)
     await update.message.reply_text(  # type: ignore[union-attr]
         "❌ Cancelled. Tap /start to return to the main menu.",
+    )
+
+
+async def cmd_stats(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """/stats — open the analytics dashboard."""
+    user_id = update.effective_user.id  # type: ignore[union-attr]
+    if not _is_authorized(user_id):
+        await update.message.reply_text("⛔ You are not authorised to use this bot.")  # type: ignore[union-attr]
+        return
+    summary = db.get_reaction_summary(today_only=True)
+    active_count = len(reactor.clients)
+    total = summary["total_success"] + summary["total_failed"]
+    rate = (
+        f"{summary['total_success'] * 100 / total:.1f}%"
+        if total > 0
+        else "N/A"
+    )
+    text = (
+        "📊 *Analytics Dashboard*\n\n"
+        f"📌 Posts handled today: *{summary['total_posts']}*\n"
+        f"✅ Success: *{summary['total_success']}*  |  "
+        f"❌ Failed: *{summary['total_failed']}*\n"
+        f"📈 Success rate: *{rate}*\n"
+        f"👥 Active accounts: *{active_count}*\n\n"
+        "Choose a view:"
+    )
+    await update.message.reply_text(  # type: ignore[union-attr]
+        text,
+        reply_markup=_stats_main_kb(),
+        parse_mode="Markdown",
     )
 
 
@@ -508,7 +570,7 @@ async def _route_callback(query: Any, user_id: int, role: str | None, data: str)
     # Keep state during active input flows.
     keep = ("acc_add", "acc_master", "acc_rebind", "skip_phone",
             "ch_add", "em_add", "adm_add",
-            "set_role", "cancel", "instant_react")
+            "set_role", "cancel", "instant_react", "stats")
     if not data.startswith(keep):
         await _cleanup_temp_client(user_id)
         user_states.pop(user_id, None)
@@ -544,6 +606,96 @@ async def _route_callback(query: Any, user_id: int, role: str | None, data: str)
             reply_markup=InlineKeyboardMarkup(
                 [[InlineKeyboardButton("❌ Cancel", callback_data="main")]]
             ),
+            parse_mode="Markdown",
+        )
+
+    # ─── Analytics Dashboard ──────────────────────────────────── #
+    elif data == "stats":
+        summary = db.get_reaction_summary(today_only=True)
+        active_count = len(reactor.clients)
+        total = summary["total_success"] + summary["total_failed"]
+        rate = (
+            f"{summary['total_success'] * 100 / total:.1f}%"
+            if total > 0
+            else "N/A"
+        )
+        text = (
+            "📊 *Analytics Dashboard*\n\n"
+            f"📌 Posts handled today: *{summary['total_posts']}*\n"
+            f"✅ Success: *{summary['total_success']}*  |  "
+            f"❌ Failed: *{summary['total_failed']}*\n"
+            f"📈 Success rate: *{rate}*\n"
+            f"👥 Active accounts: *{active_count}*\n\n"
+            "Choose a view:"
+        )
+        await query.edit_message_text(
+            text,
+            reply_markup=_stats_main_kb(),
+            parse_mode="Markdown",
+        )
+
+    elif data == "stats_summary":
+        summary = db.get_reaction_summary(today_only=True)
+        active_count = len(reactor.clients)
+        total = summary["total_success"] + summary["total_failed"]
+        rate = (
+            f"{summary['total_success'] * 100 / total:.1f}%"
+            if total > 0
+            else "N/A"
+        )
+        lines = [
+            "📊 *Summary — Today*\n",
+            f"📌 Unique posts: *{summary['total_posts']}*",
+            f"✅ Success: *{summary['total_success']}*  |  "
+            f"❌ Failed: *{summary['total_failed']}*",
+            f"📈 Success rate: *{rate}*",
+            f"👥 Active accounts: *{active_count}*",
+        ]
+        if summary["channels"]:
+            lines.append("\n*Channel Breakdown:*")
+            for ch in summary["channels"]:
+                lines.append(
+                    f"• {ch['channel_name']}  —  "
+                    f"✅ {ch['success_count']}  ❌ {ch['failed_count']}"
+                )
+        else:
+            lines.append("\n_No reaction data for today yet._")
+
+        await query.edit_message_text(
+            "\n".join(lines),
+            reply_markup=_stats_nav_kb("summary"),
+            parse_mode="Markdown",
+        )
+
+    elif data == "stats_errors":
+        errors = db.get_error_logs(limit=15)
+        if errors:
+            lines = ["🛠️ *Recent Error Logs*\n"]
+            for i, err in enumerate(errors, 1):
+                ts = err.get("created_at", "?")
+                if isinstance(ts, str) and len(ts) > 16:
+                    ts = ts[:16].replace("T", " ")
+                lines.append(
+                    f"*{i}.* `{ts}`\n"
+                    f"   📡 {err.get('channel_name', '?')}  •  "
+                    f"Post `{err.get('post_id', '?')}`\n"
+                    f"   👤 {err.get('account_name', '?')}\n"
+                    f"   ⚠️ `{err.get('error_message', 'Unknown')}`\n"
+                )
+        else:
+            lines = ["🛠️ *Error Logs*\n\n_No errors recorded._ 🎉"]
+
+        await query.edit_message_text(
+            "\n".join(lines),
+            reply_markup=_stats_nav_kb("errors"),
+            parse_mode="Markdown",
+        )
+
+    elif data == "stats_clear":
+        count = db.clear_old_logs(days=7)
+        await query.edit_message_text(
+            f"🗑️ *Cleared {count} log(s)* older than 7 days.",
+            reply_markup=_stats_main_kb(),
             parse_mode="Markdown",
         )
 
@@ -938,10 +1090,14 @@ async def _route_callback(query: Any, user_id: int, role: str | None, data: str)
 
     elif data.startswith("ch_del_y:"):
         ch_id = data.split(":", 1)[1]
+        ch = db.get_channel(ch_id)
+        ch_tg_id = int(ch["channel_id"]) if ch else None
         db.delete_channel(ch_id)
         await reactor.reload_channels()
+        if ch_tg_id is not None:
+            await reactor.auto_leave_channel(ch_tg_id)
         await query.edit_message_text(
-            "✅ Channel removed.",
+            "✅ Channel removed. All accounts auto-left.",
             reply_markup=InlineKeyboardMarkup([[_back_button("channels")]]),
         )
 
@@ -1604,16 +1760,18 @@ async def _route_text(msg: Any, user_id: int, state: dict) -> None:  # noqa: C90
             try:
                 db.add_channel(channel_id, channel_name, user_id)
                 await reactor.reload_channels()
-                await reactor.auto_join_channel(channel_id)
+                await reactor.auto_join_all_accounts(channel_id)
                 try:
                     await progress.edit_text(
-                        f"✅ Channel *{channel_name}* (`{channel_id}`) added!",
+                        f"✅ Channel *{channel_name}* (`{channel_id}`) added!\n"
+                        f"All accounts auto-joined.",
                         reply_markup=InlineKeyboardMarkup([[_back_button("channels")]]),
                         parse_mode="Markdown",
                     )
                 except Exception:
                     await msg.reply_text(
-                        f"✅ Channel *{channel_name}* (`{channel_id}`) added!",
+                        f"✅ Channel *{channel_name}* (`{channel_id}`) added!\n"
+                        f"All accounts auto-joined.",
                         reply_markup=InlineKeyboardMarkup([[_back_button("channels")]]),
                         parse_mode="Markdown",
                     )
@@ -1657,9 +1815,10 @@ async def _route_text(msg: Any, user_id: int, state: dict) -> None:  # noqa: C90
             try:
                 db.add_channel(channel_id, channel_name, user_id)
                 await reactor.reload_channels()
-                await reactor.auto_join_channel(channel_id)
+                await reactor.auto_join_all_accounts(channel_id)
                 await msg.reply_text(
-                    f"✅ Channel *{channel_name}* added!",
+                    f"✅ Channel *{channel_name}* added!\n"
+                    f"All accounts auto-joined.",
                     reply_markup=InlineKeyboardMarkup([[_back_button("channels")]]),
                     parse_mode="Markdown",
                 )
@@ -1768,6 +1927,7 @@ def setup_handlers(app: Application, database: Database, react: Reactor) -> None
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("cancel", cmd_cancel))
+    app.add_handler(CommandHandler("stats", cmd_stats))
     app.add_handler(CommandHandler("addadmin", cmd_addadmin))
     app.add_handler(CallbackQueryHandler(callback_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))

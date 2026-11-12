@@ -1,6 +1,16 @@
-"""Supabase database helper (v7) – CRUD for accounts, channels, emojis,
-and user roles, with a lightweight in-memory TTL cache to eliminate
-response lag on hot-path reads (channels, emojis, role lookups).
+"""Supabase database helper (v9) – CRUD for accounts, channels, emojis,
+user roles, and reaction logs, with a lightweight in-memory TTL cache to
+eliminate response lag on hot-path reads (channels, emojis, role lookups).
+
+v9 changes
+──────────
+• ``reaction_logs`` table support: ``log_reaction()``,
+  ``get_reaction_summary()``, ``get_error_logs()``,
+  ``clear_old_logs()``.
+
+v8 changes
+──────────
+• ``update_account_session()`` for rebind flow.
 
 v7 changes
 ──────────
@@ -429,3 +439,143 @@ class Database:
             self._cache.invalidate(*self._ROLE_CACHE_KEYS)
         except Exception:
             log.exception("delete_user_role_by_user_id failed for %d", user_id)
+
+    # ================================================================ #
+    #  Reaction logs                                                    #
+    # ================================================================ #
+
+    def log_reaction(
+        self,
+        channel_id: int,
+        channel_name: str,
+        post_id: int,
+        account_id: str,
+        account_name: str,
+        status: str,
+        error_message: str | None = None,
+    ) -> None:
+        """Insert a single reaction outcome into ``reaction_logs``.
+
+        *status* must be ``'success'`` or ``'failed'``.
+        """
+        try:
+            self.client.table("reaction_logs").insert(
+                {
+                    "channel_id": channel_id,
+                    "channel_name": channel_name,
+                    "post_id": post_id,
+                    "account_id": account_id,
+                    "account_name": account_name,
+                    "status": status,
+                    "error_message": error_message,
+                }
+            ).execute()
+        except Exception:
+            log.exception("log_reaction failed for %s/%s", channel_id, post_id)
+
+    def get_reaction_summary(self, today_only: bool = True) -> dict[str, Any]:
+        """Return aggregated summary data for the analytics dashboard.
+
+        Returns a dict with keys:
+        - ``total_success``: int
+        - ``total_failed``: int
+        - ``total_posts``: int  (unique channel_id+post_id pairs)
+        - ``channels``: list of {channel_name, success_count, failed_count}
+        """
+        try:
+            q = self.client.table("reaction_logs").select("*")
+            if today_only:
+                q = q.gte("created_at", _today_start())
+            rows = q.execute().data
+
+            total_success = 0
+            total_failed = 0
+            posts_seen: set[str] = set()
+            channel_stats: dict[str, dict[str, int]] = {}
+
+            for r in rows:
+                post_key = f"{r['channel_id']}:{r['post_id']}"
+                posts_seen.add(post_key)
+
+                ch_name = r.get("channel_name") or str(r["channel_id"])
+                if ch_name not in channel_stats:
+                    channel_stats[ch_name] = {"success": 0, "failed": 0}
+
+                if r["status"] == "success":
+                    total_success += 1
+                    channel_stats[ch_name]["success"] += 1
+                else:
+                    total_failed += 1
+                    channel_stats[ch_name]["failed"] += 1
+
+            channels = [
+                {
+                    "channel_name": name,
+                    "success_count": stats["success"],
+                    "failed_count": stats["failed"],
+                }
+                for name, stats in channel_stats.items()
+            ]
+
+            return {
+                "total_success": total_success,
+                "total_failed": total_failed,
+                "total_posts": len(posts_seen),
+                "channels": channels,
+            }
+        except Exception:
+            log.exception("get_reaction_summary failed")
+            return {
+                "total_success": 0,
+                "total_failed": 0,
+                "total_posts": 0,
+                "channels": [],
+            }
+
+    def get_error_logs(self, limit: int = 20) -> list[dict[str, Any]]:
+        """Return the most recent failed reaction logs for the error view."""
+        try:
+            return (
+                self.client.table("reaction_logs")
+                .select("*")
+                .eq("status", "failed")
+                .order("created_at", desc=True)
+                .limit(limit)
+                .execute()
+                .data
+            )
+        except Exception:
+            log.exception("get_error_logs failed")
+            return []
+
+    def clear_old_logs(self, days: int = 7) -> int:
+        """Delete reaction logs older than *days* days.
+
+        Returns the number of rows deleted (best-effort).
+        """
+        try:
+            from datetime import datetime, timedelta, timezone
+
+            cutoff = (
+                datetime.now(timezone.utc) - timedelta(days=days)
+            ).isoformat()
+            res = (
+                self.client.table("reaction_logs")
+                .delete()
+                .lt("created_at", cutoff)
+                .execute()
+            )
+            count = len(res.data) if res.data else 0
+            log.info("Cleared %d old reaction logs (older than %d days).", count, days)
+            return count
+        except Exception:
+            log.exception("clear_old_logs failed")
+            return 0
+
+
+def _today_start() -> str:
+    """Return the start of today (UTC) as an ISO-8601 string."""
+    from datetime import datetime, timezone
+
+    now = datetime.now(timezone.utc)
+    return now.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()

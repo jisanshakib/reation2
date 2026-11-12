@@ -45,6 +45,24 @@ CREATE TABLE IF NOT EXISTS users_roles (
     created_at  TIMESTAMPTZ  NOT NULL DEFAULT now()
 );
 
+CREATE TABLE IF NOT EXISTS reaction_logs (
+    id            UUID DEFAULT gen_random_uuid() PRIMARY KEY,
+    channel_id    BIGINT       NOT NULL,
+    channel_name  TEXT         NOT NULL DEFAULT '',
+    post_id       BIGINT       NOT NULL,
+    account_id    TEXT         NOT NULL,
+    account_name  TEXT         NOT NULL DEFAULT '',
+    status        TEXT         NOT NULL CHECK (status IN ('success', 'failed')),
+    error_message TEXT,
+    created_at    TIMESTAMPTZ  NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS reaction_logs_created_at_idx
+    ON reaction_logs (created_at DESC);
+
+CREATE INDEX IF NOT EXISTS reaction_logs_status_idx
+    ON reaction_logs (status);
+
 -- ============================================================
 -- MIGRATION from v6 → v7 (add is_master column):
 --
@@ -53,4 +71,26 @@ CREATE TABLE IF NOT EXISTS users_roles (
 --
 --   CREATE UNIQUE INDEX IF NOT EXISTS accounts_single_master
 --       ON accounts (is_master) WHERE is_master = true;
+-- ============================================================
+
+-- ============================================================
+-- MIGRATION from v8 → v9 (add reaction_logs table):
+--
+--   CREATE TABLE IF NOT EXISTS reaction_logs (
+--       id            UUID DEFAULT gen_random_uuid() PRIMARY KEY,
+--       channel_id    BIGINT       NOT NULL,
+--       channel_name  TEXT         NOT NULL DEFAULT '',
+--       post_id       BIGINT       NOT NULL,
+--       account_id    TEXT         NOT NULL,
+--       account_name  TEXT         NOT NULL DEFAULT '',
+--       status        TEXT         NOT NULL CHECK (status IN ('success', 'failed')),
+--       error_message TEXT,
+--       created_at    TIMESTAMPTZ  NOT NULL DEFAULT now()
+--   );
+--
+--   CREATE INDEX IF NOT EXISTS reaction_logs_created_at_idx
+--       ON reaction_logs (created_at DESC);
+--
+--   CREATE INDEX IF NOT EXISTS reaction_logs_status_idx
+--       ON reaction_logs (status);
 -- ============================================================
