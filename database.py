@@ -195,6 +195,18 @@ class Database:
         except Exception:
             log.exception("delete_account failed for %s", account_id)
 
+    def update_account_session(self, account_id: str, session_str: str) -> None:
+        """Replace the session string for an existing account and mark it active."""
+        try:
+            (
+                self.client.table("accounts")
+                .update({"session_str": session_str, "status": "active"})
+                .eq("id", account_id)
+                .execute()
+            )
+        except Exception:
+            log.exception("update_account_session failed for %s", account_id)
+
     # ── Master account management ─────────────────────────────────── #
 
     def get_master_account(self) -> dict[str, Any] | None:

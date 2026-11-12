@@ -1,26 +1,42 @@
-"""100 % Inline-Keyboard-driven Telegram bot UI  (v7).
+"""100 % Inline-Keyboard-driven Telegram bot UI  (v8).
 
-v7 changes
+v8 changes
 ──────────
-• 👑 Master Account UI: accounts list shows 👑 badge for the master
-  account.  Account detail view displays "👑 Master Account" or
-  "⚙️ Worker Account" badge.  "👑 Set as Master" button available
-  in account detail (owner / admin only, when not already master).
-• After adding a channel, ``reactor.auto_join_channel()`` is called
-  so the master account joins automatically.
-• Help text updated to explain the Master / Worker concept.
+• **Smart Account Add with Dual Session Options**: after entering name,
+  API ID, and API Hash the wizard presents a choice:
+  – 📋 *Manual Session Paste* (legacy string-session input).
+  – ⚡ *Auto Session Generator* (built-in: phone → OTP → optional 2FA
+    → extracts StringSession automatically).
+• **Interactive Account Rebind** (``🔄 Rebind`` button): shows stored
+  details (never the session string), tests the existing session, and
+  if it's dead re-authenticates in-place with OTP / 2FA flow.
+• Temporary Telethon clients used during auto-gen and rebind are cleaned
+  up on cancel, error, or success via ``_cleanup_temp_client()``.
 
-Preserved from v5
+Preserved from v7
 ──────────────────
-• ⚡ Instant Reaction, channel link / @username resolution, admin
-  @username resolution, full registration wizard, emoji management,
-  admin panel, role management, /addadmin command.
+• 👑 Master Account UI, ⚡ Instant Reaction, channel link / @username
+  resolution, admin @username resolution, emoji management, admin
+  panel, role management, /addadmin command.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any
+
+from telethon import TelegramClient
+from telethon.errors import (
+    SessionPasswordNeededError,
+    PhoneCodeInvalidError,
+    PhoneCodeExpiredError,
+    PasswordHashInvalidError,
+    FloodWaitError,
+    AuthKeyUnregisteredError,
+    UserDeactivatedBanError,
+)
+from telethon.sessions import StringSession
 
 from telegram import (
     InlineKeyboardButton,
@@ -43,10 +59,15 @@ from reactor import Reactor
 
 log = logging.getLogger(__name__)
 
+# Timeout for Telethon RPC inside the bot flows.
+_TEL_TIMEOUT = 20.0
+
 # ------------------------------------------------------------------ #
 #  In-memory user states  (keyed by ``user_id``)                     #
 # ------------------------------------------------------------------ #
-# States: reg_name, reg_phone, reg_api_id, reg_api_hash, reg_session,
+# States: reg_name, reg_api_id, reg_api_hash, reg_session_choice,
+#         reg_session, reg_auto_phone, reg_auto_otp, reg_auto_2fa,
+#         rebind_otp, rebind_2fa,
 #         check, add_channel, add_emoji, add_role_user, add_role_select,
 #         instant_react
 
@@ -55,6 +76,25 @@ user_states: dict[int, dict[str, Any]] = {}
 # Module-level references – set once by ``setup_handlers``.
 db: Database = None  # type: ignore[assignment]
 reactor: Reactor = None  # type: ignore[assignment]
+
+
+# ================================================================== #
+#  Temp-client cleanup helper                                         #
+# ================================================================== #
+
+async def _cleanup_temp_client(user_id: int) -> None:
+    """Disconnect and discard any temporary Telethon client stored in
+    the user's state (used during auto-gen and rebind flows)."""
+    state = user_states.get(user_id)
+    if state is None:
+        return
+    client: TelegramClient | None = state["data"].pop("_client", None)
+    if client is not None:
+        try:
+            if client.is_connected():
+                await client.disconnect()
+        except Exception:
+            pass
 
 
 # ================================================================== #
@@ -145,6 +185,9 @@ def _account_detail_kb(
                 InlineKeyboardButton("Check 🔍", callback_data=f"acc_chk:{acc_id}"),
                 InlineKeyboardButton("Delete 🗑️", callback_data=f"acc_del:{acc_id}"),
             ]
+        )
+        rows.append(
+            [InlineKeyboardButton("🔄 Rebind", callback_data=f"acc_rebind:{acc_id}")]
         )
         if not is_master:
             rows.append(
@@ -242,6 +285,18 @@ def _role_select_kb() -> InlineKeyboardMarkup:
     )
 
 
+# ── Session choice (during registration) ───────────────────────── #
+
+def _session_choice_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("📋 Manual Session Paste", callback_data="acc_add_manual")],
+            [InlineKeyboardButton("⚡ Auto Session Generator", callback_data="acc_add_auto")],
+            [InlineKeyboardButton("❌ Cancel", callback_data="accounts")],
+        ]
+    )
+
+
 # ================================================================== #
 #  Help text                                                          #
 # ================================================================== #
@@ -262,16 +317,19 @@ _HELP_TEXT = (
     "• Only one Master can be active at a time.\n"
     "• The Master auto-joins new channels when they are added.\n\n"
 
-    "*📱 Adding Accounts (StringSession)*\n"
+    "*📱 Adding Accounts*\n"
     "1. Go to https://my.telegram.org → log in → create an app.\n"
     "2. Note your *API ID* and *API Hash*.\n"
-    "3. Generate a Session String:\n"
-    "`from telethon.sync import TelegramClient`\n"
-    "`from telethon.sessions import StringSession`\n"
-    "`with TelegramClient(StringSession(), API_ID, API_HASH) as c:`\n"
-    "`    print(c.session.save())`\n"
-    "4. In the bot tap *📱 Accounts → ➕ Add Account* and follow the 5-step wizard "
-    "(Name → Phone → API ID → API Hash → Session String).\n\n"
+    "3. Tap *📱 Accounts → ➕ Add Account* and enter Name, API ID, API Hash.\n"
+    "4. Choose a session method:\n"
+    "   • *📋 Manual Paste* — paste an existing StringSession.\n"
+    "   • *⚡ Auto Generator* — enter your phone number, receive OTP "
+    "in Telegram, and the bot generates the session for you.\n\n"
+
+    "*🔄 Account Rebind*\n"
+    "• If an account's session expires, tap its name → *🔄 Rebind*.\n"
+    "• The bot tests the existing session and, if expired, walks you "
+    "through a fresh OTP / 2FA login without deleting the account.\n\n"
 
     "*📡 Adding Target Channels*\n"
     "1. Tap *📡 Channels → ➕ Add Channel*.\n"
@@ -307,7 +365,7 @@ _HELP_TEXT = (
 
 
 # ================================================================== #
-#  /start command                                                     #
+#  /start and /cancel commands                                        #
 # ================================================================== #
 
 async def cmd_start(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -315,6 +373,7 @@ async def cmd_start(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not _is_authorized(user_id):
         await update.message.reply_text("⛔ You are not authorised to use this bot.")  # type: ignore[union-attr]
         return
+    await _cleanup_temp_client(user_id)
     user_states.pop(user_id, None)
     await update.message.reply_text(  # type: ignore[union-attr]
         "🤖 *Auto-Reaction Bot*\n\nSelect an option:",
@@ -323,8 +382,18 @@ async def cmd_start(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+async def cmd_cancel(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Cancel any active flow and return to main menu."""
+    user_id = update.effective_user.id  # type: ignore[union-attr]
+    await _cleanup_temp_client(user_id)
+    user_states.pop(user_id, None)
+    await update.message.reply_text(  # type: ignore[union-attr]
+        "❌ Cancelled. Tap /start to return to the main menu.",
+    )
+
+
 # ================================================================== #
-#  /addadmin command  (owner only, v5 – accepts @username)            #
+#  /addadmin command  (owner only – accepts @username)                #
 # ================================================================== #
 
 async def cmd_addadmin(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -348,12 +417,10 @@ async def cmd_addadmin(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
     raw_target = parts[1]
 
-    # Determine role.
     role = "admin"
     if len(parts) >= 3 and parts[2].lower() in ("admin", "moderator"):
         role = parts[2].lower()
 
-    # Resolve @username to numeric ID if needed.
     if raw_target.startswith("@"):
         await msg.reply_text(f"🔄 Resolving `{raw_target}`…", parse_mode="Markdown")
         resolved = await reactor.resolve_user_id(raw_target)
@@ -439,13 +506,16 @@ async def _route_callback(query: Any, user_id: int, role: str | None, data: str)
     """Inner dispatch – separated so the caller can catch exceptions."""
 
     # Keep state during active input flows.
-    keep = ("acc_add", "acc_master", "skip_phone", "ch_add", "em_add", "adm_add",
+    keep = ("acc_add", "acc_master", "acc_rebind", "skip_phone",
+            "ch_add", "em_add", "adm_add",
             "set_role", "cancel", "instant_react")
     if not data.startswith(keep):
+        await _cleanup_temp_client(user_id)
         user_states.pop(user_id, None)
 
     # ─── Main menu ─────────────────────────────────────────────── #
     if data == "main":
+        await _cleanup_temp_client(user_id)
         user_states.pop(user_id, None)
         await query.edit_message_text(
             "🤖 *Auto-Reaction Bot*\n\nSelect an option:",
@@ -501,19 +571,53 @@ async def _route_callback(query: Any, user_id: int, role: str | None, data: str)
             parse_mode="Markdown",
         )
 
+    # ─── Add Account: Step 1 (name) ────────────────────────────── #
     elif data == "acc_add":
         if not _can_manage_accounts(user_id):
             await query.answer("⛔ Admins and Owner only", show_alert=True)
             return
         user_states[user_id] = {"step": "reg_name", "data": {}}
         await query.edit_message_text(
-            "📝 *Register Account — Step 1/5*\n\nSend the *Account Name*:",
+            "📝 *Register Account — Step 1/4*\n\nSend the *Account Name/Label*:",
             reply_markup=InlineKeyboardMarkup(
                 [[InlineKeyboardButton("❌ Cancel", callback_data="accounts")]]
             ),
             parse_mode="Markdown",
         )
 
+    # ─── Add Account: Session choice callbacks ─────────────────── #
+    elif data == "acc_add_manual":
+        state = user_states.get(user_id)
+        if not state or state["step"] != "reg_session_choice":
+            await query.answer("Session expired. Start again.", show_alert=True)
+            return
+        state["step"] = "reg_session"
+        await query.edit_message_text(
+            "📋 *Manual Session Paste*\n\n"
+            "Send the *Telethon StringSession* string:",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("❌ Cancel", callback_data="accounts")]]
+            ),
+            parse_mode="Markdown",
+        )
+
+    elif data == "acc_add_auto":
+        state = user_states.get(user_id)
+        if not state or state["step"] != "reg_session_choice":
+            await query.answer("Session expired. Start again.", show_alert=True)
+            return
+        state["step"] = "reg_auto_phone"
+        await query.edit_message_text(
+            "⚡ *Auto Session Generator — Phone*\n\n"
+            "Send the *phone number* with country code.\n"
+            "Example: `+8801712345678`",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("❌ Cancel", callback_data="accounts")]]
+            ),
+            parse_mode="Markdown",
+        )
+
+    # ─── Account detail ───────────────────────────────────────── #
     elif data.startswith("acc:"):
         acc_id = data.split(":", 1)[1]
         acc = db.get_account(acc_id)
@@ -626,19 +730,160 @@ async def _route_callback(query: Any, user_id: int, role: str | None, data: str)
                 parse_mode="Markdown",
             )
 
-    # ─── Skip phone ────────────────────────────────────────────── #
-    elif data == "skip_phone":
-        state = user_states.get(user_id)
-        if state and state["step"] == "reg_phone":
-            state["data"]["phone"] = None
-            state["step"] = "reg_api_id"
+    # ─── Rebind: preview + start ───────────────────────────────── #
+    elif data.startswith("acc_rebind:"):
+        if not _can_manage_accounts(user_id):
+            await query.answer("⛔ Admins and Owner only", show_alert=True)
+            return
+        acc_id = data.split(":", 1)[1]
+        acc = db.get_account(acc_id)
+        if acc is None:
             await query.edit_message_text(
-                "📝 *Register Account — Step 3/5*\n\nSend the *API ID*:",
+                "Account not found.",
+                reply_markup=InlineKeyboardMarkup([[_back_button("accounts")]]),
+            )
+            return
+        if role == "admin" and acc["owner_id"] != user_id:
+            await query.answer("⛔ Not your account", show_alert=True)
+            return
+        text = (
+            "🔄 *Account Rebind*\n\n"
+            f"• *Name:* {acc['name']}\n"
+            f"• *Phone:* {acc.get('phone') or 'N/A'}\n"
+            f"• *API ID:* `{acc['api_id']}`\n"
+            f"• *API Hash:* `{acc['api_hash'][:8]}…`\n"
+            f"• *Status:* {'🟢 Active' if acc['status'] == 'active' else '🔴 Failed'}\n\n"
+            "🔒 _Session string is never displayed._\n\n"
+            "Tap *🚀 Start Re-authentication* to test the current session "
+            "and refresh it if expired."
+        )
+        await query.edit_message_text(
+            text,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🚀 Start Re-authentication", callback_data=f"acc_rebind_go:{acc_id}")],
+                [_back_button(f"acc:{acc_id}")],
+            ]),
+            parse_mode="Markdown",
+        )
+
+    # ─── Rebind: test & re-auth ────────────────────────────────── #
+    elif data.startswith("acc_rebind_go:"):
+        if not _can_manage_accounts(user_id):
+            await query.answer("⛔ Admins and Owner only", show_alert=True)
+            return
+        acc_id = data.split(":", 1)[1]
+        acc = db.get_account(acc_id)
+        if acc is None:
+            await query.edit_message_text(
+                "Account not found.",
+                reply_markup=InlineKeyboardMarkup([[_back_button("accounts")]]),
+            )
+            return
+
+        await query.edit_message_text(
+            "🔄 *Testing existing session…*\nPlease wait ⏳",
+            parse_mode="Markdown",
+        )
+
+        # Test the existing session.
+        try:
+            test_client = TelegramClient(
+                StringSession(acc["session_str"]),
+                int(acc["api_id"]),
+                acc["api_hash"],
+            )
+            await asyncio.wait_for(test_client.connect(), timeout=_TEL_TIMEOUT)
+            authorized = await asyncio.wait_for(
+                test_client.is_user_authorized(), timeout=_TEL_TIMEOUT
+            )
+            if authorized:
+                # Session is still valid!
+                await test_client.disconnect()
+                db.update_account_status(acc_id, "active")
+                # Reconnect in reactor if not already connected.
+                if acc_id not in reactor.clients:
+                    refreshed = db.get_account(acc_id)
+                    if refreshed:
+                        try:
+                            await reactor.add_client(refreshed)
+                        except Exception:
+                            pass
+                await query.edit_message_text(
+                    "✅ *Session is valid!*\n\n"
+                    f"Account *{acc['name']}* is active — no re-authentication needed.",
+                    reply_markup=InlineKeyboardMarkup([[_back_button(f"acc:{acc_id}")]]),
+                    parse_mode="Markdown",
+                )
+                return
+            # Not authorized — need fresh login.
+            await test_client.disconnect()
+        except Exception as e:
+            log.debug("Rebind: existing session test failed: %s", e)
+            try:
+                await test_client.disconnect()  # type: ignore[possibly-undefined]
+            except Exception:
+                pass
+
+        # Session is dead. Check if we have a phone number to re-auth.
+        phone = acc.get("phone")
+        if not phone:
+            await query.edit_message_text(
+                "❌ *Session expired* but no phone number is stored for this account.\n\n"
+                "Please delete and re-register the account, or use *🔄 Rebind* "
+                "after adding a phone number.",
+                reply_markup=InlineKeyboardMarkup([[_back_button(f"acc:{acc_id}")]]),
+                parse_mode="Markdown",
+            )
+            return
+
+        # Start fresh login flow.
+        try:
+            fresh_client = TelegramClient(
+                StringSession(),
+                int(acc["api_id"]),
+                acc["api_hash"],
+            )
+            await asyncio.wait_for(fresh_client.connect(), timeout=_TEL_TIMEOUT)
+            await asyncio.wait_for(
+                fresh_client.send_code_request(phone), timeout=_TEL_TIMEOUT
+            )
+
+            user_states[user_id] = {
+                "step": "rebind_otp",
+                "data": {
+                    "account_id": acc_id,
+                    "phone": phone,
+                    "_client": fresh_client,
+                },
+            }
+            await query.edit_message_text(
+                "🔐 *OTP Sent!*\n\n"
+                f"A verification code has been sent to `{phone}`.\n"
+                "Please enter the *OTP code*:\n\n"
+                "💡 _Type /cancel to abort._",
                 reply_markup=InlineKeyboardMarkup(
-                    [[InlineKeyboardButton("❌ Cancel", callback_data="accounts")]]
+                    [[InlineKeyboardButton("❌ Cancel", callback_data=f"acc:{acc_id}")]]
                 ),
                 parse_mode="Markdown",
             )
+        except FloodWaitError as e:
+            await query.edit_message_text(
+                f"❌ *FloodWait:* please wait {e.seconds} seconds before retrying.",
+                reply_markup=InlineKeyboardMarkup([[_back_button(f"acc:{acc_id}")]]),
+                parse_mode="Markdown",
+            )
+        except Exception as e:
+            log.exception("Rebind: send_code_request failed")
+            await query.edit_message_text(
+                f"❌ Failed to send OTP: `{e}`",
+                reply_markup=InlineKeyboardMarkup([[_back_button(f"acc:{acc_id}")]]),
+                parse_mode="Markdown",
+            )
+
+    # ─── Skip phone (removed — no longer needed) ──────────────── #
+    elif data == "skip_phone":
+        # Legacy compatibility — ignore.
+        pass
 
     # ─── Channels ──────────────────────────────────────────────── #
     elif data == "channels":
@@ -831,7 +1076,7 @@ async def _route_callback(query: Any, user_id: int, role: str | None, data: str)
         if not state or state["step"] != "add_role_select":
             await query.answer("No pending user. Start again.", show_alert=True)
             return
-        chosen_role = data.split(":", 1)[1]  # "admin" or "moderator"
+        chosen_role = data.split(":", 1)[1]
         target_uid = state["data"]["target_user_id"]
         user_states.pop(user_id, None)
         try:
@@ -852,6 +1097,7 @@ async def _route_callback(query: Any, user_id: int, role: str | None, data: str)
 
     # ─── Cancel ────────────────────────────────────────────────── #
     elif data == "cancel":
+        await _cleanup_temp_client(user_id)
         user_states.pop(user_id, None)
         await query.edit_message_text(
             "🤖 *Auto-Reaction Bot*\n\nSelect an option:",
@@ -883,6 +1129,7 @@ async def text_handler(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await _route_text(msg, user_id, state)
     except Exception:
         log.exception("Unhandled error in text_handler for user %d", user_id)
+        await _cleanup_temp_client(user_id)
         user_states.pop(user_id, None)
         try:
             await msg.reply_text(
@@ -898,7 +1145,7 @@ async def _route_text(msg: Any, user_id: int, state: dict) -> None:  # noqa: C90
     step = state["step"]
     text = msg.text or ""
 
-    # ── Registration flow (owner / admin only) ────────────────── #
+    # ── Registration: Account Name ─────────────────────────────── #
     if step == "reg_name":
         if not _can_manage_accounts(user_id):
             user_states.pop(user_id, None)
@@ -907,29 +1154,16 @@ async def _route_text(msg: Any, user_id: int, state: dict) -> None:  # noqa: C90
             await msg.reply_text("❗ Account name cannot be empty. Please try again.")
             return
         state["data"]["name"] = text.strip()
-        state["step"] = "reg_phone"
-        await msg.reply_text(
-            "📝 *Register Account — Step 2/5*\n\nSend the *Phone Number* or tap Skip:",
-            reply_markup=InlineKeyboardMarkup(
-                [
-                    [InlineKeyboardButton("Skip ⏭️", callback_data="skip_phone")],
-                    [InlineKeyboardButton("❌ Cancel", callback_data="accounts")],
-                ]
-            ),
-            parse_mode="Markdown",
-        )
-
-    elif step == "reg_phone":
-        state["data"]["phone"] = text.strip() or None
         state["step"] = "reg_api_id"
         await msg.reply_text(
-            "📝 *Register Account — Step 3/5*\n\nSend the *API ID*:",
+            "📝 *Register Account — Step 2/4*\n\nSend the *API ID*:",
             reply_markup=InlineKeyboardMarkup(
                 [[InlineKeyboardButton("❌ Cancel", callback_data="accounts")]]
             ),
             parse_mode="Markdown",
         )
 
+    # ── Registration: API ID ───────────────────────────────────── #
     elif step == "reg_api_id":
         if not text.strip().isdigit():
             await msg.reply_text("❗ API ID must be numeric. Please try again.")
@@ -937,33 +1171,37 @@ async def _route_text(msg: Any, user_id: int, state: dict) -> None:  # noqa: C90
         state["data"]["api_id"] = text.strip()
         state["step"] = "reg_api_hash"
         await msg.reply_text(
-            "📝 *Register Account — Step 4/5*\n\nSend the *API Hash*:",
+            "📝 *Register Account — Step 3/4*\n\nSend the *API Hash*:",
             reply_markup=InlineKeyboardMarkup(
                 [[InlineKeyboardButton("❌ Cancel", callback_data="accounts")]]
             ),
             parse_mode="Markdown",
         )
 
+    # ── Registration: API Hash → Session Choice ────────────────── #
     elif step == "reg_api_hash":
         if not text.strip():
             await msg.reply_text("❗ API Hash cannot be empty. Please try again.")
             return
         state["data"]["api_hash"] = text.strip()
-        state["step"] = "reg_session"
+        state["step"] = "reg_session_choice"
         await msg.reply_text(
-            "📝 *Register Account — Step 5/5*\n\nSend the *Telethon Session String*:",
-            reply_markup=InlineKeyboardMarkup(
-                [[InlineKeyboardButton("❌ Cancel", callback_data="accounts")]]
-            ),
+            "📝 *Register Account — Step 4/4*\n\n"
+            "How would you like to provide the session?\n\n"
+            "📋 *Manual Paste* — paste a pre-generated StringSession.\n"
+            "⚡ *Auto Generator* — log in via phone OTP right here.",
+            reply_markup=_session_choice_kb(),
             parse_mode="Markdown",
         )
 
+    # ── Registration: Manual Session Paste ─────────────────────── #
     elif step == "reg_session":
         if not text.strip():
             await msg.reply_text("❗ Session string cannot be empty. Please try again.")
             return
         state["data"]["session_str"] = text.strip()
         d = state["data"]
+        user_states.pop(user_id, None)
         try:
             acc = db.add_account(
                 owner_id=user_id,
@@ -973,7 +1211,6 @@ async def _route_text(msg: Any, user_id: int, state: dict) -> None:  # noqa: C90
                 api_hash=d["api_hash"],
                 session_str=d["session_str"],
             )
-            user_states.pop(user_id, None)
             try:
                 await reactor.add_client(acc)
                 status_msg = "🟢 Connected successfully!"
@@ -988,10 +1225,316 @@ async def _route_text(msg: Any, user_id: int, state: dict) -> None:  # noqa: C90
             )
         except Exception as e:
             log.exception("Failed to save account")
-            user_states.pop(user_id, None)
             await msg.reply_text(
                 f"❌ Failed to save: `{e}`",
                 reply_markup=InlineKeyboardMarkup([[_back_button("accounts")]]),
+                parse_mode="Markdown",
+            )
+
+    # ── Registration: Auto Generator — Phone ───────────────────── #
+    elif step == "reg_auto_phone":
+        phone = text.strip()
+        if not phone:
+            await msg.reply_text("❗ Phone number cannot be empty.")
+            return
+        d = state["data"]
+        progress = await msg.reply_text(
+            f"📲 *Sending OTP to* `{phone}`…\nPlease wait ⏳",
+            parse_mode="Markdown",
+        )
+        try:
+            client = TelegramClient(
+                StringSession(),
+                int(d["api_id"]),
+                d["api_hash"],
+            )
+            await asyncio.wait_for(client.connect(), timeout=_TEL_TIMEOUT)
+            await asyncio.wait_for(
+                client.send_code_request(phone), timeout=_TEL_TIMEOUT
+            )
+            state["data"]["phone"] = phone
+            state["data"]["_client"] = client
+            state["step"] = "reg_auto_otp"
+            try:
+                await progress.edit_text(
+                    "🔐 *OTP Sent!*\n\n"
+                    f"A verification code has been sent to `{phone}`.\n"
+                    "Please enter the *OTP code*:\n\n"
+                    "💡 _Type /cancel to abort._",
+                    reply_markup=InlineKeyboardMarkup(
+                        [[InlineKeyboardButton("❌ Cancel", callback_data="accounts")]]
+                    ),
+                    parse_mode="Markdown",
+                )
+            except Exception:
+                await msg.reply_text(
+                    "🔐 *OTP Sent!* Enter the *OTP code*:",
+                    reply_markup=InlineKeyboardMarkup(
+                        [[InlineKeyboardButton("❌ Cancel", callback_data="accounts")]]
+                    ),
+                    parse_mode="Markdown",
+                )
+        except FloodWaitError as e:
+            await progress.edit_text(
+                f"❌ *FloodWait:* please wait {e.seconds}s before retrying.",
+                reply_markup=InlineKeyboardMarkup([[_back_button("accounts")]]),
+                parse_mode="Markdown",
+            )
+            user_states.pop(user_id, None)
+        except Exception as e:
+            log.exception("Auto-gen: send_code_request failed")
+            try:
+                await progress.edit_text(
+                    f"❌ Failed to send OTP: `{e}`",
+                    reply_markup=InlineKeyboardMarkup([[_back_button("accounts")]]),
+                    parse_mode="Markdown",
+                )
+            except Exception:
+                await msg.reply_text(
+                    f"❌ Failed to send OTP: `{e}`",
+                    reply_markup=InlineKeyboardMarkup([[_back_button("accounts")]]),
+                    parse_mode="Markdown",
+                )
+            user_states.pop(user_id, None)
+
+    # ── Registration: Auto Generator — OTP ─────────────────────── #
+    elif step == "reg_auto_otp":
+        code = text.strip()
+        if not code:
+            await msg.reply_text("❗ OTP code cannot be empty.")
+            return
+        d = state["data"]
+        client: TelegramClient = d["_client"]
+        phone = d["phone"]
+        try:
+            await asyncio.wait_for(
+                client.sign_in(phone=phone, code=code),
+                timeout=_TEL_TIMEOUT,
+            )
+            # Success — extract session.
+            session_str = client.session.save()
+            await client.disconnect()
+            state["data"].pop("_client", None)
+            user_states.pop(user_id, None)
+            acc = db.add_account(
+                owner_id=user_id,
+                name=d["name"],
+                phone=phone,
+                api_id=d["api_id"],
+                api_hash=d["api_hash"],
+                session_str=session_str,
+            )
+            try:
+                await reactor.add_client(acc)
+                status_msg = "🟢 Connected successfully!"
+            except Exception as e:
+                log.exception("Failed to connect auto-gen account %s", acc["id"])
+                db.update_account_status(acc["id"], "failed")
+                status_msg = f"🔴 Saved but connection failed: `{e}`"
+            await msg.reply_text(
+                f"✅ *Account registered via Auto Generator!*\n\n{status_msg}",
+                reply_markup=InlineKeyboardMarkup([[_back_button("accounts")]]),
+                parse_mode="Markdown",
+            )
+        except SessionPasswordNeededError:
+            # 2FA required.
+            state["step"] = "reg_auto_2fa"
+            await msg.reply_text(
+                "🔒 *Two-Step Verification Required*\n\n"
+                "This account has a cloud password enabled.\n"
+                "Please enter your *2FA password*:\n\n"
+                "💡 _Type /cancel to abort._",
+                reply_markup=InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("❌ Cancel", callback_data="accounts")]]
+                ),
+                parse_mode="Markdown",
+            )
+        except (PhoneCodeInvalidError, PhoneCodeExpiredError) as e:
+            await msg.reply_text(
+                f"❌ *Invalid or expired OTP code.*\n`{e}`\n\nPlease try again:",
+                reply_markup=InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("❌ Cancel", callback_data="accounts")]]
+                ),
+                parse_mode="Markdown",
+            )
+            # Stay on reg_auto_otp step so user can re-enter.
+        except Exception as e:
+            log.exception("Auto-gen: sign_in failed")
+            await _cleanup_temp_client(user_id)
+            user_states.pop(user_id, None)
+            await msg.reply_text(
+                f"❌ Login failed: `{e}`",
+                reply_markup=InlineKeyboardMarkup([[_back_button("accounts")]]),
+                parse_mode="Markdown",
+            )
+
+    # ── Registration: Auto Generator — 2FA ─────────────────────── #
+    elif step == "reg_auto_2fa":
+        password = text.strip()
+        if not password:
+            await msg.reply_text("❗ Password cannot be empty.")
+            return
+        d = state["data"]
+        client = d["_client"]
+        try:
+            await asyncio.wait_for(
+                client.sign_in(password=password),
+                timeout=_TEL_TIMEOUT,
+            )
+            session_str = client.session.save()
+            await client.disconnect()
+            state["data"].pop("_client", None)
+            user_states.pop(user_id, None)
+            acc = db.add_account(
+                owner_id=user_id,
+                name=d["name"],
+                phone=d["phone"],
+                api_id=d["api_id"],
+                api_hash=d["api_hash"],
+                session_str=session_str,
+            )
+            try:
+                await reactor.add_client(acc)
+                status_msg = "🟢 Connected successfully!"
+            except Exception as e:
+                log.exception("Failed to connect auto-gen account %s", acc["id"])
+                db.update_account_status(acc["id"], "failed")
+                status_msg = f"🔴 Saved but connection failed: `{e}`"
+            await msg.reply_text(
+                f"✅ *Account registered via Auto Generator!*\n\n{status_msg}",
+                reply_markup=InlineKeyboardMarkup([[_back_button("accounts")]]),
+                parse_mode="Markdown",
+            )
+        except PasswordHashInvalidError:
+            await msg.reply_text(
+                "❌ *Wrong password.* Please try again:",
+                reply_markup=InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("❌ Cancel", callback_data="accounts")]]
+                ),
+                parse_mode="Markdown",
+            )
+            # Stay on reg_auto_2fa step.
+        except Exception as e:
+            log.exception("Auto-gen: 2FA sign_in failed")
+            await _cleanup_temp_client(user_id)
+            user_states.pop(user_id, None)
+            await msg.reply_text(
+                f"❌ 2FA login failed: `{e}`",
+                reply_markup=InlineKeyboardMarkup([[_back_button("accounts")]]),
+                parse_mode="Markdown",
+            )
+
+    # ── Rebind: OTP ────────────────────────────────────────────── #
+    elif step == "rebind_otp":
+        code = text.strip()
+        if not code:
+            await msg.reply_text("❗ OTP code cannot be empty.")
+            return
+        d = state["data"]
+        client = d["_client"]
+        phone = d["phone"]
+        acc_id = d["account_id"]
+        try:
+            await asyncio.wait_for(
+                client.sign_in(phone=phone, code=code),
+                timeout=_TEL_TIMEOUT,
+            )
+            # Success — extract session.
+            session_str = client.session.save()
+            await client.disconnect()
+            state["data"].pop("_client", None)
+            user_states.pop(user_id, None)
+            db.update_account_session(acc_id, session_str)
+            # Reconnect in reactor.
+            await reactor.remove_client(acc_id)
+            refreshed = db.get_account(acc_id)
+            if refreshed:
+                try:
+                    await reactor.add_client(refreshed)
+                except Exception:
+                    pass
+            await msg.reply_text(
+                "✅ *Account rebound successfully!*\n\n"
+                "🟢 Fresh session saved and reactor reloaded.",
+                reply_markup=InlineKeyboardMarkup([[_back_button(f"acc:{acc_id}")]]),
+                parse_mode="Markdown",
+            )
+        except SessionPasswordNeededError:
+            state["step"] = "rebind_2fa"
+            await msg.reply_text(
+                "🔒 *Two-Step Verification Required*\n\n"
+                "Please enter your *2FA password*:\n\n"
+                "💡 _Type /cancel to abort._",
+                reply_markup=InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("❌ Cancel", callback_data=f"acc:{acc_id}")]]
+                ),
+                parse_mode="Markdown",
+            )
+        except (PhoneCodeInvalidError, PhoneCodeExpiredError) as e:
+            await msg.reply_text(
+                f"❌ *Invalid or expired OTP code.*\n`{e}`\n\nPlease try again:",
+                reply_markup=InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("❌ Cancel", callback_data=f"acc:{acc_id}")]]
+                ),
+                parse_mode="Markdown",
+            )
+        except Exception as e:
+            log.exception("Rebind: sign_in failed")
+            await _cleanup_temp_client(user_id)
+            user_states.pop(user_id, None)
+            await msg.reply_text(
+                f"❌ Login failed: `{e}`",
+                reply_markup=InlineKeyboardMarkup([[_back_button(f"acc:{acc_id}")]]),
+                parse_mode="Markdown",
+            )
+
+    # ── Rebind: 2FA ────────────────────────────────────────────── #
+    elif step == "rebind_2fa":
+        password = text.strip()
+        if not password:
+            await msg.reply_text("❗ Password cannot be empty.")
+            return
+        d = state["data"]
+        client = d["_client"]
+        acc_id = d["account_id"]
+        try:
+            await asyncio.wait_for(
+                client.sign_in(password=password),
+                timeout=_TEL_TIMEOUT,
+            )
+            session_str = client.session.save()
+            await client.disconnect()
+            state["data"].pop("_client", None)
+            user_states.pop(user_id, None)
+            db.update_account_session(acc_id, session_str)
+            await reactor.remove_client(acc_id)
+            refreshed = db.get_account(acc_id)
+            if refreshed:
+                try:
+                    await reactor.add_client(refreshed)
+                except Exception:
+                    pass
+            await msg.reply_text(
+                "✅ *Account rebound successfully!*\n\n"
+                "🟢 Fresh session saved and reactor reloaded.",
+                reply_markup=InlineKeyboardMarkup([[_back_button(f"acc:{acc_id}")]]),
+                parse_mode="Markdown",
+            )
+        except PasswordHashInvalidError:
+            await msg.reply_text(
+                "❌ *Wrong password.* Please try again:",
+                reply_markup=InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("❌ Cancel", callback_data=f"acc:{acc_id}")]]
+                ),
+                parse_mode="Markdown",
+            )
+        except Exception as e:
+            log.exception("Rebind: 2FA sign_in failed")
+            await _cleanup_temp_client(user_id)
+            user_states.pop(user_id, None)
+            await msg.reply_text(
+                f"❌ 2FA login failed: `{e}`",
+                reply_markup=InlineKeyboardMarkup([[_back_button(f"acc:{acc_id}")]]),
                 parse_mode="Markdown",
             )
 
@@ -1029,7 +1572,7 @@ async def _route_text(msg: Any, user_id: int, state: dict) -> None:  # noqa: C90
                 parse_mode="Markdown",
             )
 
-    # ── Add channel (v5 – link / @username / numeric ID) ──────── #
+    # ── Add channel (link / @username / numeric ID) ────────────── #
     elif step == "add_channel":
         user_states.pop(user_id, None)
         raw = text.strip()
@@ -1061,7 +1604,6 @@ async def _route_text(msg: Any, user_id: int, state: dict) -> None:  # noqa: C90
             try:
                 db.add_channel(channel_id, channel_name, user_id)
                 await reactor.reload_channels()
-                # Master auto-joins the new channel.
                 await reactor.auto_join_channel(channel_id)
                 try:
                     await progress.edit_text(
@@ -1115,7 +1657,6 @@ async def _route_text(msg: Any, user_id: int, state: dict) -> None:  # noqa: C90
             try:
                 db.add_channel(channel_id, channel_name, user_id)
                 await reactor.reload_channels()
-                # Master auto-joins the new channel.
                 await reactor.auto_join_channel(channel_id)
                 await msg.reply_text(
                     f"✅ Channel *{channel_name}* added!",
@@ -1206,7 +1747,6 @@ async def _route_text(msg: Any, user_id: int, state: dict) -> None:  # noqa: C90
             )
             user_states.pop(user_id, None)
             return
-        # Transition to role selection.
         state["step"] = "add_role_select"
         state["data"]["target_user_id"] = target_uid
         await msg.reply_text(
@@ -1227,6 +1767,7 @@ def setup_handlers(app: Application, database: Database, react: Reactor) -> None
     reactor = react
 
     app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("cancel", cmd_cancel))
     app.add_handler(CommandHandler("addadmin", cmd_addadmin))
     app.add_handler(CallbackQueryHandler(callback_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
