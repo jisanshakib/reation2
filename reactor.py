@@ -11,9 +11,14 @@ v7 changes
 • **Master-Worker split**: one account is designated ``is_master``
   in the database.  ``start()`` reads this, stores ``self.master_id``,
   and only the master gets a NewMessage event handler + catch_up.
-• **Fallback poll loop**: ``_master_poll_loop()`` runs every 7 s on
+• **Fallback poll loop**: ``_master_poll_loop()`` runs every 15 s on
   the master client, calling ``get_messages`` on each target channel
   so new posts are never missed even if the event handler stalls.
+  Uses a per-channel ``_last_seen`` dict for fast comparison.
+• **Entity pre-caching**: ``_prime_master_channels()`` calls
+  ``get_dialogs()`` and ``get_entity()`` for every target channel on
+  startup and whenever channels change, so Telethon's internal cache
+  is populated and update subscriptions are established.
 • **Auto-join**: ``auto_join_channel()`` makes the master (or any
   available client) join a channel automatically when it is added.
   Supports public channels and private invite links.
@@ -79,7 +84,7 @@ _RPC_TIMEOUT = 15.0
 _KEEPALIVE_INTERVAL = 60
 
 # How often (seconds) the master fallback poll checks for new posts.
-_POLL_INTERVAL = 7
+_POLL_INTERVAL = 15
 
 # Telethon errors that mean the session is dead / revoked.
 _AUTH_FATAL_ERRORS = (AuthKeyUnregisteredError, UserDeactivatedBanError)
@@ -153,6 +158,9 @@ class Reactor:
         # Master poll loop task.
         self._poll_task: asyncio.Task | None = None
 
+        # Per-channel last-seen message ID for fast poll comparison.
+        self._last_seen: dict[int, int] = {}
+
         # Telegram Bot reference – set via set_bot(), used to send alerts.
         self._bot: Bot | None = None
 
@@ -213,6 +221,10 @@ class Reactor:
             for acc, res in zip(accounts, results):
                 if isinstance(res, Exception):
                     log.error("Startup connect failed for %s: %s", acc["name"], res)
+
+        # Prime the master's entity cache so Telethon subscribes to
+        # channel updates and the poll loop can resolve entities.
+        await self._prime_master_channels()
 
         # Launch the master fallback poll loop.
         self._start_poll_loop()
@@ -394,6 +406,75 @@ class Reactor:
             del self._peer_cache[k]
 
     # ================================================================ #
+    #  Entity pre-caching — force Telethon to subscribe to channels   #
+    # ================================================================ #
+
+    async def _prime_master_channels(self) -> None:
+        """Ensure the master client has fully resolved and cached every
+        target channel entity.
+
+        Telethon only delivers ``events.NewMessage`` for chats whose
+        entities it has seen.  Calling ``get_dialogs()`` populates the
+        internal entity cache, and per-channel ``get_entity()`` calls
+        ensure each target is individually resolved.  Finally, a quick
+        ``get_messages(limit=1)`` seeds ``_last_seen`` so the poll loop
+        knows the current high-water mark and won't false-fire on old
+        posts.
+        """
+        mc = self.master_client
+        if mc is None or not mc.is_connected():
+            log.debug("_prime_master_channels: master not available, skipping.")
+            return
+
+        if not self.target_channels:
+            log.debug("_prime_master_channels: no target channels, skipping.")
+            return
+
+        # Step 1: fetch full dialog list so Telethon populates its
+        # internal entity cache and subscribes to update channels.
+        try:
+            await asyncio.wait_for(mc.get_dialogs(), timeout=30.0)
+            log.info(
+                "Master dialogs fetched – Telethon entity cache populated."
+            )
+        except Exception as e:
+            log.warning("_prime_master_channels: get_dialogs failed: %s", e)
+
+        # Step 2: explicitly resolve each target channel entity and
+        # seed the _last_seen high-water mark.
+        for ch_id in list(self.target_channels):
+            try:
+                entity = await asyncio.wait_for(
+                    mc.get_entity(ch_id), timeout=_RPC_TIMEOUT
+                )
+                title = getattr(entity, "title", None) or str(ch_id)
+                log.info(
+                    "Primed channel entity: %s (%s)", title, ch_id
+                )
+            except Exception as e:
+                log.warning(
+                    "_prime_master_channels: get_entity failed for %s: %s",
+                    ch_id, e,
+                )
+
+            # Seed _last_seen so the poll loop doesn't react to
+            # already-existing messages on first cycle.
+            try:
+                msgs = await asyncio.wait_for(
+                    mc.get_messages(ch_id, limit=1), timeout=_RPC_TIMEOUT
+                )
+                if msgs and msgs[0] is not None:
+                    self._last_seen[ch_id] = msgs[0].id
+                    log.debug(
+                        "Seeded _last_seen[%s] = %d", ch_id, msgs[0].id
+                    )
+            except Exception as e:
+                log.debug(
+                    "_prime_master_channels: seed get_messages failed for %s: %s",
+                    ch_id, e,
+                )
+
+    # ================================================================ #
     #  Master poll loop — fallback that catches missed events          #
     # ================================================================ #
 
@@ -406,9 +487,13 @@ class Reactor:
     async def _master_poll_loop(self) -> None:
         """Every ``_POLL_INTERVAL`` seconds, use the master client to
         fetch the latest messages from each target channel and dispatch
-        sweeps for any that haven't been processed yet.
+        sweeps for any that are newer than ``_last_seen[channel]``.
 
-        This is a safety net in case the event handler misses something.
+        Uses a per-channel high-water mark (``_last_seen``) for fast
+        comparison instead of the global ``_processed`` dedup set, so
+        even if the event handler already processed a message the poll
+        loop won't re-fire.  New detections are also recorded in
+        ``_processed`` to prevent the event handler from double-firing.
         """
         try:
             while True:
@@ -428,9 +513,23 @@ class Reactor:
                             mc.get_messages(chat_id, limit=3),
                             timeout=_RPC_TIMEOUT,
                         )
+                        if not messages:
+                            continue
+
+                        prev_last = self._last_seen.get(chat_id, 0)
+                        new_last = prev_last
+
                         for m in messages:
                             if m is None:
                                 continue
+                            # Track the highest ID we've seen.
+                            if m.id > new_last:
+                                new_last = m.id
+
+                            # Skip messages we already know about.
+                            if m.id <= prev_last:
+                                continue
+
                             key = (chat_id, m.id)
                             async with self._dedup_lock:
                                 if key in self._processed:
@@ -453,13 +552,16 @@ class Reactor:
                             self._bg_tasks.add(task)
                             task.add_done_callback(self._bg_tasks.discard)
 
+                        # Update the high-water mark.
+                        if new_last > prev_last:
+                            self._last_seen[chat_id] = new_last
+
                     except asyncio.CancelledError:
                         raise
                     except _AUTH_FATAL_ERRORS as e:
                         log.warning(
                             "Poll: master session dead: %s", e
                         )
-                        # Don't remove here — keepalive will handle it.
                         break
                     except Exception:
                         log.debug(
@@ -546,6 +648,11 @@ class Reactor:
         for ch_id in new_channels:
             await self.auto_join_channel(ch_id)
 
+        # Re-prime entity cache if channels changed so Telethon
+        # subscribes to the new channel's updates.
+        if new_channels:
+            await self._prime_master_channels()
+
     async def reload_emojis(self) -> None:
         rows = self.db.get_emojis()
         self.allowed_emojis = [r["emoji"] for r in rows]
@@ -630,7 +737,8 @@ class Reactor:
         # Restart the poll loop with the new master.
         self._start_poll_loop()
 
-        # Auto-join all target channels with the new master.
+        # Prime entity cache and auto-join all target channels.
+        await self._prime_master_channels()
         for ch_id in list(self.target_channels):
             await self.auto_join_channel(ch_id)
 
