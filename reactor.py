@@ -151,6 +151,11 @@ class Reactor:
         self._processed: OrderedDict[tuple[int, int], None] = OrderedDict()
         self._dedup_lock = asyncio.Lock()
 
+        # Per-account reaction dedup: (acc_id, chat_id, msg_id).
+        # Once an account has reacted to a post, it is never sent again
+        # (prevents toggling / overwriting / removing reactions).
+        self._reacted: set[tuple[str, int, int]] = set()
+
         # Semaphore that caps concurrent sweep tasks.
         self._sweep_sem = asyncio.Semaphore(_MAX_CONCURRENT_SWEEPS)
 
@@ -728,6 +733,106 @@ class Reactor:
                 continue
             await self._join_client_to_channel(acc_id, client, channel_entity)
             await asyncio.sleep(0.5)  # light stagger to avoid flood
+
+    async def join_all_accounts_all_channels(
+        self,
+        progress_callback: Any = None,
+    ) -> dict[str, Any]:
+        """Join every connected account to every saved channel.
+
+        Each account × channel pair is attempted up to 3 times with
+        exponential backoff.  Accounts already in the channel are
+        counted as ``already`` and skipped.
+
+        *progress_callback* is an optional ``async def(done, total, info)``
+        called after each pair for live UI updates.
+
+        Returns::
+
+            {
+                "total": int,
+                "joined": int,
+                "already": int,
+                "failed_count": int,
+                "failed_details": [{"account": str, "channel": str}, ...],
+            }
+        """
+        channels = self.db.get_channels()
+        accounts = [(aid, c) for aid, c in self.clients.items() if c.is_connected()]
+
+        total = len(accounts) * len(channels)
+        joined = 0
+        already = 0
+        failed_details: list[dict[str, str]] = []
+        done = 0
+
+        for ch in channels:
+            ch_id = int(ch["channel_id"])
+            ch_name = ch.get("channel_name") or str(ch_id)
+
+            for acc_id, client in accounts:
+                acc_label = acc_id[:8]
+                success = False
+                is_already = False
+
+                for attempt in range(1, 4):  # max 3 retries
+                    try:
+                        entity = await asyncio.wait_for(
+                            client.get_entity(ch_id), timeout=_RPC_TIMEOUT
+                        )
+                        if await self._is_member(client, entity, acc_label=acc_label):
+                            is_already = True
+                            success = True
+                            break
+
+                        await asyncio.wait_for(
+                            client(JoinChannelRequest(channel=entity)),
+                            timeout=_RPC_TIMEOUT,
+                        )
+                        success = True
+                        break
+
+                    except FloodWaitError as e:
+                        log.warning(
+                            "JoinAll: FloodWait %ds for %s on %s (attempt %d/3)",
+                            e.seconds, acc_label, ch_name, attempt,
+                        )
+                        await asyncio.sleep(min(e.seconds, 30))
+                    except Exception as e:
+                        log.debug(
+                            "JoinAll: %s failed to join %s (attempt %d/3): %s",
+                            acc_label, ch_name, attempt, e,
+                        )
+                        await asyncio.sleep(2 * attempt)  # backoff
+
+                if is_already:
+                    already += 1
+                elif success:
+                    joined += 1
+                else:
+                    acc = self.db.get_account(acc_id)
+                    failed_details.append({
+                        "account": acc["name"] if acc else acc_label,
+                        "channel": ch_name,
+                    })
+
+                done += 1
+                if progress_callback is not None:
+                    info_icon = "ℹ️" if is_already else ("✅" if success else "❌")
+                    await progress_callback(
+                        done, total,
+                        f"{info_icon} `{acc_label}` → `{ch_name}`",
+                    )
+
+                await asyncio.sleep(0.5)  # stagger between accounts
+
+        return {
+            "total": total,
+            "joined": joined,
+            "already": already,
+            "failed_count": len(failed_details),
+            "failed_details": failed_details,
+        }
 
     async def auto_leave_channel(self, channel_entity: int | str) -> None:
         """Make ALL connected accounts leave a channel.
@@ -1514,6 +1619,16 @@ class Reactor:
 
                     acc_label = acc_id[:8]
 
+                    # Per-account dedup — never re-react on same post.
+                    react_key = (acc_id, chat_id, msg_id)
+                    if react_key in self._reacted:
+                        log.debug(
+                            "Sweep: %s already reacted to %s/%s — skipping.",
+                            acc_label, chat_id, msg_id,
+                        )
+                        succeeded.add(acc_id)
+                        continue
+
                     try:
                         peer = await self._resolve_peer(acc_id, client, chat_id)
 
@@ -1525,6 +1640,7 @@ class Reactor:
                             acc_label=acc_label,
                         )
                         if result is not None:
+                            self._reacted.add(react_key)
                             succeeded.add(acc_id)
                             self._log_outcome(chat_id, msg_id, acc_id, "success")
                         else:
@@ -1958,6 +2074,17 @@ class Reactor:
                             timeout=_RPC_TIMEOUT,
                         )
 
+                    # Per-account dedup — never re-react on same post.
+                    ir_chat = chat_id if raw_id else username
+                    ir_key = (acc_id, hash(ir_chat), msg_id)
+                    if ir_key in self._reacted:
+                        log.debug(
+                            "Instant: %s already reacted to msg %d — skipping.",
+                            acc_id[:8], msg_id,
+                        )
+                        succeeded.add(acc_id)
+                        continue
+
                     result = await self._try_react_with_fallback(
                         client=client,
                         peer=peer,
@@ -1966,6 +2093,7 @@ class Reactor:
                         acc_label=acc_id[:8],
                     )
                     if result:
+                        self._reacted.add(ir_key)
                         log.info(
                             "Instant: %s reacted with %s", acc_id[:8], result
                         )

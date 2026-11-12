@@ -209,6 +209,7 @@ def _channels_kb(channels: list[dict]) -> InlineKeyboardMarkup:
             [InlineKeyboardButton(f"📡 {ch['channel_name']}", callback_data=f"ch:{ch['id']}")]
         )
     rows.append([InlineKeyboardButton("➕ Add Channel", callback_data="ch_add")])
+    rows.append([InlineKeyboardButton("🔗 Join All Accounts", callback_data="ch_join_all")])
     rows.append([_back_button()])
     return InlineKeyboardMarkup(rows)
 
@@ -1156,6 +1157,62 @@ async def _route_callback(query: Any, user_id: int, role: str | None, data: str)
         await query.edit_message_text(
             "✅ Channel removed. All accounts auto-left.",
             reply_markup=InlineKeyboardMarkup([[_back_button("channels")]]),
+        )
+
+    # ─── Join All Accounts to All Channels ─────────────────────── #
+    elif data == "ch_join_all":
+        if not _can_manage_channels(user_id):
+            await query.answer("⛔ Not authorized", show_alert=True)
+            return
+
+        channels = db.get_channels()
+        if not channels:
+            await query.answer("No channels saved.", show_alert=True)
+            return
+
+        await query.edit_message_text(
+            "🔗 *Join All Accounts — Starting…*\n\n"
+            "Joining all active accounts to all saved channels.\n"
+            "Please wait ⏳",
+            parse_mode="Markdown",
+        )
+
+        progress_msg = query.message
+
+        async def _join_progress(done: int, total: int, info: str) -> None:
+            try:
+                await progress_msg.edit_text(
+                    f"🔗 *Join All Accounts — Processing…*\n\n"
+                    f"{info}\n"
+                    f"Progress: *{done}/{total}*\n\n"
+                    f"⏳ Please wait…",
+                    parse_mode="Markdown",
+                )
+            except BadRequest:
+                pass
+            except Exception:
+                pass
+
+        result = await reactor.join_all_accounts_all_channels(
+            progress_callback=_join_progress,
+        )
+
+        lines = [
+            "🔗 *Join All Accounts — Complete!*\n",
+            f"✅ Newly Joined: *{result['joined']}*",
+            f"ℹ️ Already Joined: *{result['already']}*",
+            f"❌ Failed: *{result['failed_count']}*",
+            f"📊 Total Pairs: *{result['total']}*",
+        ]
+        if result["failed_details"]:
+            lines.append("\n*Failed (after 3 retries):*")
+            for f in result["failed_details"]:
+                lines.append(f"• 🔴 `{f['account']}` → `{f['channel']}`")
+
+        await progress_msg.edit_text(
+            "\n".join(lines),
+            reply_markup=InlineKeyboardMarkup([[_back_button("channels")]]),
+            parse_mode="Markdown",
         )
 
     # ─── Emojis ────────────────────────────────────────────────── #
