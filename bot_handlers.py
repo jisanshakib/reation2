@@ -1,12 +1,19 @@
-"""100 % Inline-Keyboard-driven Telegram bot UI  (v4).
+"""100 % Inline-Keyboard-driven Telegram bot UI  (v5).
 
-v4 changes
+v5 changes
 ──────────
+• ⚡ Instant Reaction: new main-menu button → user sends a post link →
+  ALL active accounts react to it immediately, no pre-registration required.
+• Channel addition now accepts t.me links and @usernames in addition to
+  raw numeric IDs. Telethon resolves the entity automatically.
+• Admin addition (both inline panel and /addadmin command) accepts
+  @usernames alongside numeric User IDs.
 • Top-level try/except in ``callback_handler`` and ``text_handler`` so
   no unhandled exception can crash a callback or leave the UI hanging.
 • ``telegram.error.BadRequest: Message is not modified`` silently ignored
   (user double-clicking the same button).
-• ``/addadmin <user_id> [admin|moderator]`` command handler (owner only).
+• ``/addadmin <user_id_or_@username> [admin|moderator]`` command handler
+  (owner only).
 • Friendly "No items yet" messages when accounts/channels/emojis are empty.
 • All DB look-ups in callback_handler wrapped for safety.
 """
@@ -41,7 +48,8 @@ log = logging.getLogger(__name__)
 #  In-memory user states  (keyed by ``user_id``)                     #
 # ------------------------------------------------------------------ #
 # States: reg_name, reg_phone, reg_api_id, reg_api_hash, reg_session,
-#         check, add_channel, add_emoji, add_role_user, add_role_select
+#         check, add_channel, add_emoji, add_role_user, add_role_select,
+#         instant_react
 
 user_states: dict[int, dict[str, Any]] = {}
 
@@ -100,6 +108,7 @@ def _main_menu_kb(user_id: int) -> InlineKeyboardMarkup:
         [InlineKeyboardButton("📱 Accounts", callback_data="accounts")],
         [InlineKeyboardButton("📡 Channels", callback_data="channels")],
         [InlineKeyboardButton("😀 Emojis", callback_data="emojis")],
+        [InlineKeyboardButton("⚡ Instant Reaction", callback_data="instant_react")],
     ]
     if role == "owner":
         rows.append([InlineKeyboardButton("👑 Admins", callback_data="admins")])
@@ -248,10 +257,18 @@ _HELP_TEXT = (
     "(Name → Phone → API ID → API Hash → Session String).\n\n"
 
     "*📡 Adding Target Channels*\n"
-    "1. Find the channel's numeric ID (e.g. forward a msg to @userinfobot).\n"
-    "2. Tap *📡 Channels → ➕ Add Channel*.\n"
-    "3. Send the ID and name: `-1001234567890 My Channel`\n"
+    "1. Tap *📡 Channels → ➕ Add Channel*.\n"
+    "2. Send a channel link, @username, or numeric ID:\n"
+    "   • `https://t.me/mychannel`\n"
+    "   • `@mychannel`\n"
+    "   • `-1001234567890 My Channel`\n"
+    "3. The bot resolves the entity automatically.\n"
     "4. Make sure every registered account has *joined* the channel.\n\n"
+
+    "*⚡ Instant Reaction*\n"
+    "• Tap *⚡ Instant Reaction* in the main menu.\n"
+    "• Send any post link (e.g. `https://t.me/channel/123`).\n"
+    "• ALL active accounts will instantly react — no pre-registration needed.\n\n"
 
     "*😀 Managing Reaction Emojis*\n"
     "• Tap *😀 Emojis → ➕ Add Emoji* and send a single emoji.\n"
@@ -268,7 +285,7 @@ _HELP_TEXT = (
 
     "*⌨️ Quick Commands*\n"
     "• /start — open the main menu.\n"
-    "• /addadmin `<user_id>` `[admin|moderator]` — (Owner only) assign a role."
+    "• /addadmin `<user_id or @username>` `[admin|moderator]` — (Owner only) assign a role."
 )
 
 
@@ -290,11 +307,11 @@ async def cmd_start(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 # ================================================================== #
-#  /addadmin command  (owner only, v4)                                #
+#  /addadmin command  (owner only, v5 – accepts @username)            #
 # ================================================================== #
 
 async def cmd_addadmin(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """Usage: ``/addadmin <user_id> [admin|moderator]``"""
+    """Usage: ``/addadmin <user_id or @username> [admin|moderator]``"""
     msg = update.message
     assert msg is not None
     user_id = msg.from_user.id  # type: ignore[union-attr]
@@ -306,21 +323,36 @@ async def cmd_addadmin(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
     parts = (msg.text or "").split()
     if len(parts) < 2:
         await msg.reply_text(
-            "Usage: `/addadmin <user_id> [admin|moderator]`\n"
+            "Usage: `/addadmin <user_id or @username> [admin|moderator]`\n"
             "Default role is *admin*.",
             parse_mode="Markdown",
         )
         return
 
-    try:
-        target_uid = int(parts[1])
-    except ValueError:
-        await msg.reply_text("❗ User ID must be numeric.")
-        return
+    raw_target = parts[1]
 
+    # Determine role.
     role = "admin"
     if len(parts) >= 3 and parts[2].lower() in ("admin", "moderator"):
         role = parts[2].lower()
+
+    # Resolve @username to numeric ID if needed.
+    if raw_target.startswith("@"):
+        await msg.reply_text(f"🔄 Resolving `{raw_target}`…", parse_mode="Markdown")
+        resolved = await reactor.resolve_user_id(raw_target)
+        if isinstance(resolved, str):
+            await msg.reply_text(resolved, parse_mode="Markdown")
+            return
+        target_uid = resolved
+    else:
+        try:
+            target_uid = int(raw_target)
+        except ValueError:
+            await msg.reply_text(
+                "❗ Provide a numeric User ID or @username.",
+                parse_mode="Markdown",
+            )
+            return
 
     if _is_permanent_owner(target_uid):
         await msg.reply_text("ℹ️ The permanent owner is always authorised.")
@@ -392,7 +424,8 @@ async def _route_callback(query: Any, user_id: int, role: str | None, data: str)
     """Inner dispatch – separated so the caller can catch exceptions."""
 
     # Keep state during active input flows.
-    keep = ("acc_add", "skip_phone", "ch_add", "em_add", "adm_add", "set_role", "cancel")
+    keep = ("acc_add", "skip_phone", "ch_add", "em_add", "adm_add",
+            "set_role", "cancel", "instant_react")
     if not data.startswith(keep):
         user_states.pop(user_id, None)
 
@@ -412,6 +445,21 @@ async def _route_callback(query: Any, user_id: int, role: str | None, data: str)
             reply_markup=InlineKeyboardMarkup([[_back_button()]]),
             parse_mode="Markdown",
             disable_web_page_preview=True,
+        )
+
+    # ─── Instant Reaction ─────────────────────────────────────── #
+    elif data == "instant_react":
+        user_states[user_id] = {"step": "instant_react", "data": {}}
+        await query.edit_message_text(
+            "⚡ *Instant Reaction*\n\n"
+            "Send a Telegram *post link* and ALL active accounts "
+            "will react to it immediately.\n\n"
+            "✅ No need to pre-add the channel!\n\n"
+            "Example: `https://t.me/channelname/123`",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("❌ Cancel", callback_data="main")]]
+            ),
+            parse_mode="Markdown",
         )
 
     # ─── Accounts ──────────────────────────────────────────────── #
@@ -561,9 +609,11 @@ async def _route_callback(query: Any, user_id: int, role: str | None, data: str)
     elif data == "ch_add":
         user_states[user_id] = {"step": "add_channel", "data": {}}
         await query.edit_message_text(
-            "📡 *Add Channel*\n\nSend the *channel ID* (numeric, e.g. `-1001234567890`)\n"
-            "and *channel name* separated by a space.\n\n"
-            "Example: `-1001234567890 My Channel`",
+            "📡 *Add Channel*\n\n"
+            "Send the channel in any of these formats:\n\n"
+            "• *Link:* `https://t.me/channelname`\n"
+            "• *Username:* `@channelname`\n"
+            "• *Numeric ID:* `-1001234567890 My Channel`",
             reply_markup=InlineKeyboardMarkup(
                 [[InlineKeyboardButton("❌ Cancel", callback_data="channels")]]
             ),
@@ -670,7 +720,7 @@ async def _route_callback(query: Any, user_id: int, role: str | None, data: str)
             return
         user_states[user_id] = {"step": "add_role_user", "data": {}}
         await query.edit_message_text(
-            "👑 *Add User*\n\nSend the Telegram *User ID*:",
+            "👑 *Add User*\n\nSend the Telegram *User ID* or *@username*:",
             reply_markup=InlineKeyboardMarkup(
                 [[InlineKeyboardButton("❌ Cancel", callback_data="admins")]]
             ),
@@ -909,41 +959,131 @@ async def _route_text(msg: Any, user_id: int, state: dict) -> None:  # noqa: C90
             parse_mode="Markdown",
         )
 
-    # ── Add channel ────────────────────────────────────────────── #
+    # ── Instant Reaction ───────────────────────────────────────── #
+    elif step == "instant_react":
+        user_states.pop(user_id, None)
+        post_link = text.strip()
+        # Send a "working…" message since this can take a while.
+        progress = await msg.reply_text(
+            "⚡ *Triggering reactions across all accounts…*\n"
+            "Please wait ⏳",
+            parse_mode="Markdown",
+        )
+        result = await reactor.instant_react(post_link)
+        try:
+            await progress.edit_text(
+                result,
+                reply_markup=InlineKeyboardMarkup([[_back_button()]]),
+                parse_mode="Markdown",
+            )
+        except Exception:
+            # If edit fails, send a new message.
+            await msg.reply_text(
+                result,
+                reply_markup=InlineKeyboardMarkup([[_back_button()]]),
+                parse_mode="Markdown",
+            )
+
+    # ── Add channel (v5 – link / @username / numeric ID) ──────── #
     elif step == "add_channel":
         user_states.pop(user_id, None)
-        parts = text.strip().split(maxsplit=1)
-        if len(parts) < 2:
-            await msg.reply_text(
-                "❗ Send the channel ID and name separated by a space.\n"
-                "Example: `-1001234567890 My Channel`",
-                reply_markup=InlineKeyboardMarkup([[_back_button("channels")]]),
+        raw = text.strip()
+
+        # Detect if user sent a link or @username.
+        if raw.startswith("https://t.me/") or raw.startswith("http://t.me/") or raw.startswith("@"):
+            # Resolve via Telethon.
+            progress = await msg.reply_text(
+                "🔄 Resolving channel…",
+                reply_markup=InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("❌ Cancel", callback_data="channels")]]
+                ),
             )
-            return
-        try:
-            channel_id = int(parts[0])
-        except ValueError:
-            await msg.reply_text(
-                "❗ Channel ID must be numeric.",
-                reply_markup=InlineKeyboardMarkup([[_back_button("channels")]]),
-            )
-            return
-        channel_name = parts[1]
-        try:
-            db.add_channel(channel_id, channel_name, user_id)
-            await reactor.reload_channels()
-            await msg.reply_text(
-                f"✅ Channel *{channel_name}* added!",
-                reply_markup=InlineKeyboardMarkup([[_back_button("channels")]]),
-                parse_mode="Markdown",
-            )
-        except Exception as e:
-            log.exception("Failed to add channel")
-            await msg.reply_text(
-                f"❌ Failed: `{e}`",
-                reply_markup=InlineKeyboardMarkup([[_back_button("channels")]]),
-                parse_mode="Markdown",
-            )
+            result = await reactor.resolve_channel_entity(raw)
+            if isinstance(result, str):
+                # Error string.
+                try:
+                    await progress.edit_text(
+                        result,
+                        reply_markup=InlineKeyboardMarkup([[_back_button("channels")]]),
+                        parse_mode="Markdown",
+                    )
+                except Exception:
+                    await msg.reply_text(
+                        result,
+                        reply_markup=InlineKeyboardMarkup([[_back_button("channels")]]),
+                        parse_mode="Markdown",
+                    )
+                return
+
+            channel_id, channel_name = result
+            try:
+                db.add_channel(channel_id, channel_name, user_id)
+                await reactor.reload_channels()
+                try:
+                    await progress.edit_text(
+                        f"✅ Channel *{channel_name}* (`{channel_id}`) added!",
+                        reply_markup=InlineKeyboardMarkup([[_back_button("channels")]]),
+                        parse_mode="Markdown",
+                    )
+                except Exception:
+                    await msg.reply_text(
+                        f"✅ Channel *{channel_name}* (`{channel_id}`) added!",
+                        reply_markup=InlineKeyboardMarkup([[_back_button("channels")]]),
+                        parse_mode="Markdown",
+                    )
+            except Exception as e:
+                log.exception("Failed to add channel")
+                try:
+                    await progress.edit_text(
+                        f"❌ Failed: `{e}`",
+                        reply_markup=InlineKeyboardMarkup([[_back_button("channels")]]),
+                        parse_mode="Markdown",
+                    )
+                except Exception:
+                    await msg.reply_text(
+                        f"❌ Failed: `{e}`",
+                        reply_markup=InlineKeyboardMarkup([[_back_button("channels")]]),
+                        parse_mode="Markdown",
+                    )
+
+        else:
+            # Legacy format: numeric ID + name.
+            parts = raw.split(maxsplit=1)
+            if len(parts) < 2:
+                await msg.reply_text(
+                    "❗ Send a channel link, @username, or numeric ID + name.\n"
+                    "Examples:\n"
+                    "• `https://t.me/channelname`\n"
+                    "• `@channelname`\n"
+                    "• `-1001234567890 My Channel`",
+                    reply_markup=InlineKeyboardMarkup([[_back_button("channels")]]),
+                    parse_mode="Markdown",
+                )
+                return
+            try:
+                channel_id = int(parts[0])
+            except ValueError:
+                await msg.reply_text(
+                    "❗ Channel ID must be numeric, or use a link / @username.",
+                    reply_markup=InlineKeyboardMarkup([[_back_button("channels")]]),
+                )
+                return
+            channel_name = parts[1]
+            try:
+                db.add_channel(channel_id, channel_name, user_id)
+                await reactor.reload_channels()
+                await msg.reply_text(
+                    f"✅ Channel *{channel_name}* added!",
+                    reply_markup=InlineKeyboardMarkup([[_back_button("channels")]]),
+                    parse_mode="Markdown",
+                )
+            except Exception as e:
+                log.exception("Failed to add channel")
+                await msg.reply_text(
+                    f"❌ Failed: `{e}`",
+                    reply_markup=InlineKeyboardMarkup([[_back_button("channels")]]),
+                    parse_mode="Markdown",
+                )
 
     # ── Add emoji ──────────────────────────────────────────────── #
     elif step == "add_emoji":
@@ -970,19 +1110,44 @@ async def _route_text(msg: Any, user_id: int, state: dict) -> None:  # noqa: C90
                 parse_mode="Markdown",
             )
 
-    # ── Add role – step 1: receive user ID ─────────────────────── #
+    # ── Add role – step 1: receive user ID or @username ────────── #
     elif step == "add_role_user":
         if not _can_manage_roles(user_id):
             user_states.pop(user_id, None)
             return
         raw = text.strip()
-        if not raw.isdigit():
+
+        # Support @username resolution.
+        if raw.startswith("@"):
+            progress = await msg.reply_text(
+                f"🔄 Resolving `{raw}`…", parse_mode="Markdown"
+            )
+            resolved = await reactor.resolve_user_id(raw)
+            if isinstance(resolved, str):
+                user_states.pop(user_id, None)
+                try:
+                    await progress.edit_text(
+                        resolved,
+                        reply_markup=InlineKeyboardMarkup([[_back_button("admins")]]),
+                        parse_mode="Markdown",
+                    )
+                except Exception:
+                    await msg.reply_text(
+                        resolved,
+                        reply_markup=InlineKeyboardMarkup([[_back_button("admins")]]),
+                        parse_mode="Markdown",
+                    )
+                return
+            target_uid = resolved
+        elif raw.isdigit() or (raw.startswith("-") and raw[1:].isdigit()):
+            target_uid = int(raw)
+        else:
             await msg.reply_text(
-                "❗ User ID must be numeric.",
+                "❗ Send a numeric User ID or @username.",
                 reply_markup=InlineKeyboardMarkup([[_back_button("admins")]]),
             )
             return
-        target_uid = int(raw)
+
         if _is_permanent_owner(target_uid):
             await msg.reply_text(
                 "ℹ️ The permanent owner is always authorised — no need to add.",

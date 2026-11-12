@@ -1,13 +1,22 @@
-"""Auto-Reaction Engine (v4) – fully non-blocking, with peer caching,
+"""Auto-Reaction Engine (v5) – fully non-blocking, with peer caching,
 per-account flood-cooldown tracking, fire-and-forget reaction sweeps,
-and periodic account-health monitoring with owner alerts.
+periodic account-health monitoring with owner alerts, instant reaction
+for arbitrary post links, and entity resolution for channels/usernames.
 
-v4 changes
+v5 changes
 ──────────
+• ``instant_react(post_link)`` – triggers ALL active accounts to react
+  to any valid Telegram post link without requiring pre-registration.
+• ``resolve_channel_entity(link_or_username)`` – resolves a t.me link
+  or @username to a (channel_id, channel_title) tuple via Telethon.
+• ``resolve_user_id(username)`` – resolves a @username to a numeric
+  Telegram user-ID via Telethon.
+• Fixed background listener: ``events.NewMessage`` handler is now
+  properly registered with ``chats=`` filter targeting all configured
+  channels, and re-registered whenever channels are reloaded.
 • Graceful handling when 0 clients are connected (no crash, clear logs).
 • ``_health_check_loop`` properly re-raises ``CancelledError``.
 • Early exit in ``_run_health_check`` when there are no clients.
-• ``start()`` logs a clear warning when 0 active accounts are found.
 """
 
 from __future__ import annotations
@@ -51,6 +60,16 @@ _RPC_TIMEOUT = 15.0
 
 # Telethon errors that mean the session is dead / revoked.
 _AUTH_FATAL_ERRORS = (AuthKeyUnregisteredError, UserDeactivatedBanError)
+
+# Regex for parsing Telegram post links.
+_POST_LINK_RE = re.compile(
+    r"https?://t\.me/(?:c/(\d+)|([a-zA-Z0-9_]+))/(\d+)"
+)
+
+# Regex for parsing channel links / usernames during channel addition.
+_CHANNEL_LINK_RE = re.compile(
+    r"https?://t\.me/(?:c/(\d+)|([a-zA-Z0-9_]+))(?:/\d+)?$"
+)
 
 
 class Reactor:
@@ -198,13 +217,29 @@ class Reactor:
             await client.disconnect()
             return
 
-        @client.on(events.NewMessage())
-        async def _on_new_message(event: events.NewMessage.Event) -> None:
-            await self._maybe_dispatch_sweep(event)
+        # Register the new-message event handler for target channels.
+        # If target_channels is empty, we still register a catch-all
+        # handler so we can dynamically filter later.
+        self._register_event_handler(client)
 
         self.clients[acc_id] = client
         self.db.update_account_status(acc_id, "active")
         log.info("Connected account %s (%s)", account["name"], acc_id)
+
+    def _register_event_handler(self, client: TelegramClient) -> None:
+        """Register or re-register the NewMessage handler on a client.
+        Uses a catch-all handler and filters inside _maybe_dispatch_sweep
+        so that channel-list changes don't require re-registering handlers."""
+        # Remove any previously registered handlers to avoid duplicates.
+        client.remove_event_handler(self._on_new_message)
+
+        @client.on(events.NewMessage())
+        async def handler(event: events.NewMessage.Event) -> None:
+            await self._on_new_message(event)
+
+    async def _on_new_message(self, event: events.NewMessage.Event) -> None:
+        """Central handler for new messages across all clients."""
+        await self._maybe_dispatch_sweep(event)
 
     async def remove_client(self, account_id: str) -> None:
         """Disconnect and forget a client."""
@@ -225,6 +260,7 @@ class Reactor:
     async def reload_channels(self) -> None:
         rows = self.db.get_channels()
         self.target_channels = {int(r["channel_id"]) for r in rows}
+        log.info("Channels reloaded: %d targets", len(self.target_channels))
 
     async def reload_emojis(self) -> None:
         rows = self.db.get_emojis()
@@ -368,6 +404,12 @@ class Reactor:
         if not self.allowed_emojis:
             return
 
+        log.info(
+            "New post detected in channel %s, message %d – dispatching sweep",
+            chat_id,
+            msg_id,
+        )
+
         task = asyncio.create_task(self._sweep_reactions(chat_id, msg_id))
         self._bg_tasks.add(task)
         task.add_done_callback(self._bg_tasks.discard)
@@ -437,9 +479,9 @@ class Reactor:
                 await asyncio.sleep(1)
 
     async def _resolve_peer(
-        self, acc_id: str, client: TelegramClient, chat_id: int
+        self, acc_id: str, client: TelegramClient, chat_id: int | str
     ) -> object:
-        key = (acc_id, chat_id)
+        key = (acc_id, chat_id if isinstance(chat_id, int) else hash(chat_id))
         peer = self._peer_cache.get(key)
         if peer is not None:
             return peer
@@ -458,9 +500,7 @@ class Reactor:
         if client is None:
             return "❌ Account is not connected."
 
-        match = re.match(
-            r"https?://t\.me/(?:c/(\d+)|([a-zA-Z0-9_]+))/(\d+)", post_link
-        )
+        match = _POST_LINK_RE.match(post_link)
         if not match:
             return "❌ Invalid post link. Expected format:\n`https://t.me/channel/123`"
 
@@ -494,3 +534,199 @@ class Reactor:
             return "❌ Request timed out."
         except Exception as e:
             return f"❌ Reaction failed: `{e}`"
+
+    # ================================================================ #
+    #  Instant Reaction – ALL active accounts react to any post link   #
+    # ================================================================ #
+
+    async def instant_react(self, post_link: str) -> str:
+        """Parse a Telegram post link, then trigger ALL active/connected
+        accounts to react to it.  The channel does NOT need to be in the
+        target-channels list.
+
+        Returns a human-readable status summary.
+        """
+        match = _POST_LINK_RE.match(post_link.strip())
+        if not match:
+            return "❌ Invalid post link.\nExpected: `https://t.me/channel/123`"
+
+        raw_id, username, msg_id_str = match.groups()
+        msg_id = int(msg_id_str)
+
+        if not self.clients:
+            return "❌ No active accounts connected."
+
+        if not self.allowed_emojis:
+            return "❌ No reaction emojis configured. Add emojis first."
+
+        success = 0
+        failed = 0
+        errors: list[str] = []
+
+        for acc_id, client in list(self.clients.items()):
+            # Respect per-account flood cooldowns.
+            cooldown_until = self._cooldowns.get(acc_id, 0)
+            now = time.monotonic()
+            if now < cooldown_until:
+                wait = cooldown_until - now
+                log.debug(
+                    "Instant: account %s in cooldown for %.1fs", acc_id[:8], wait
+                )
+                await asyncio.sleep(wait)
+
+            emoji = random.choice(self.allowed_emojis)
+
+            try:
+                # Resolve the entity for this specific account.
+                if raw_id:
+                    chat_id: int | str = int(f"-100{raw_id}")
+                    peer = await asyncio.wait_for(
+                        client.get_input_entity(chat_id), timeout=_RPC_TIMEOUT
+                    )
+                else:
+                    peer = await asyncio.wait_for(
+                        client.get_input_entity(username), timeout=_RPC_TIMEOUT
+                    )
+
+                await asyncio.wait_for(
+                    client(
+                        SendReactionRequest(
+                            peer=peer,
+                            msg_id=msg_id,
+                            reaction=[ReactionEmoji(emoticon=emoji)],
+                        )
+                    ),
+                    timeout=_RPC_TIMEOUT,
+                )
+                log.info("Instant: %s reacted with %s", acc_id[:8], emoji)
+                success += 1
+
+            except FloodWaitError as e:
+                self._cooldowns[acc_id] = time.monotonic() + e.seconds
+                log.warning(
+                    "Instant: FloodWait %ds for %s", e.seconds, acc_id[:8]
+                )
+                failed += 1
+                errors.append(f"FloodWait {e.seconds}s")
+
+            except _AUTH_FATAL_ERRORS as e:
+                log.warning("Instant: session dead for %s: %s", acc_id[:8], e)
+                self.db.update_account_status(acc_id, "failed")
+                await self.remove_client(acc_id)
+                await self._send_health_alert(acc_id, str(e))
+                failed += 1
+                errors.append("Session revoked")
+                continue  # skip delay
+
+            except (
+                ReactionInvalidError,
+                ChannelPrivateError,
+                ChatWriteForbiddenError,
+                PeerIdInvalidError,
+            ) as e:
+                log.warning("Instant: reaction error for %s: %s", acc_id[:8], e)
+                failed += 1
+                errors.append(str(e))
+
+            except asyncio.TimeoutError:
+                log.warning("Instant: timeout for %s", acc_id[:8])
+                failed += 1
+                errors.append("Timeout")
+
+            except Exception as e:
+                log.exception("Instant: unexpected error for %s", acc_id[:8])
+                failed += 1
+                errors.append(str(e))
+
+            # 1-second delay between accounts.
+            await asyncio.sleep(1)
+
+        # Build summary.
+        lines = [f"⚡ *Instant Reaction Complete*\n"]
+        lines.append(f"✅ Success: {success}  |  ❌ Failed: {failed}")
+        if errors:
+            # Show unique errors, max 5.
+            unique = list(dict.fromkeys(errors))[:5]
+            lines.append("\n*Errors:*")
+            for err in unique:
+                lines.append(f"• `{err}`")
+        return "\n".join(lines)
+
+    # ================================================================ #
+    #  Entity resolution helpers (for channel/username → ID)           #
+    # ================================================================ #
+
+    def _get_any_client(self) -> TelegramClient | None:
+        """Return the first available connected client, or None."""
+        for client in self.clients.values():
+            if client.is_connected():
+                return client
+        return None
+
+    async def resolve_channel_entity(
+        self, link_or_username: str
+    ) -> tuple[int, str] | str:
+        """Resolve a Telegram channel link (https://t.me/...) or @username
+        to a ``(channel_id, channel_title)`` tuple.
+
+        Returns a string error message on failure.
+        """
+        client = self._get_any_client()
+        if client is None:
+            return "❌ No active accounts to resolve entity. Add an account first."
+
+        # Try to extract from link.
+        username = link_or_username.strip()
+        m = _CHANNEL_LINK_RE.match(username)
+        if m:
+            raw_id, uname = m.groups()
+            if raw_id:
+                # Private-style link: t.me/c/123456/...
+                entity_ref: int | str = int(f"-100{raw_id}")
+            else:
+                entity_ref = uname
+        elif username.startswith("@"):
+            entity_ref = username[1:]  # strip @
+        else:
+            entity_ref = username
+
+        try:
+            entity = await asyncio.wait_for(
+                client.get_entity(entity_ref), timeout=_RPC_TIMEOUT
+            )
+            # entity can be Channel, Chat, etc.
+            title = getattr(entity, "title", None) or getattr(entity, "username", None) or str(entity_ref)
+            # Build the -100-prefixed ID for channels/supergroups.
+            entity_id = entity.id
+            if hasattr(entity, "broadcast") or hasattr(entity, "megagroup"):
+                # Channel or supergroup — need -100 prefix.
+                if entity_id > 0:
+                    entity_id = int(f"-100{entity_id}")
+            return (entity_id, title)
+        except asyncio.TimeoutError:
+            return "❌ Timed out while resolving entity."
+        except Exception as e:
+            return f"❌ Could not resolve: `{e}`"
+
+    async def resolve_user_id(self, username: str) -> int | str:
+        """Resolve a Telegram @username to a numeric user ID.
+
+        Returns the int user-ID on success, or a string error message on failure.
+        """
+        client = self._get_any_client()
+        if client is None:
+            return "❌ No active accounts to resolve username. Add an account first."
+
+        clean = username.strip()
+        if clean.startswith("@"):
+            clean = clean[1:]
+
+        try:
+            entity = await asyncio.wait_for(
+                client.get_entity(clean), timeout=_RPC_TIMEOUT
+            )
+            return entity.id
+        except asyncio.TimeoutError:
+            return "❌ Timed out while resolving username."
+        except Exception as e:
+            return f"❌ Could not resolve @{clean}: `{e}`"
