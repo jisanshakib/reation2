@@ -56,7 +56,12 @@ from telethon.errors import (
     UserDeactivatedBanError,
 )
 from telethon.sessions import StringSession
-from telethon.tl.functions.channels import JoinChannelRequest, LeaveChannelRequest
+from telethon.tl.functions.channels import (
+    GetParticipantRequest,
+    JoinChannelRequest,
+    LeaveChannelRequest,
+)
+from telethon.errors import UserNotParticipantError
 from telethon.tl.functions.messages import (
     ImportChatInviteRequest,
     SendReactionRequest,
@@ -585,6 +590,38 @@ class Reactor:
             raise
 
     # ================================================================ #
+    #  Smart Membership Check                                          #
+    # ================================================================ #
+
+    async def _is_member(
+        self, client: TelegramClient, entity: object, acc_label: str = "",
+    ) -> bool:
+        """Return ``True`` if *client* is already a participant of *entity*.
+
+        Uses ``GetParticipantRequest`` with the client's own user as the
+        participant.  Returns ``False`` on ``UserNotParticipantError`` or
+        any other unexpected failure (best-effort).
+        """
+        try:
+            me = await asyncio.wait_for(client.get_me(), timeout=_RPC_TIMEOUT)
+            await asyncio.wait_for(
+                client(GetParticipantRequest(channel=entity, participant=me)),
+                timeout=_RPC_TIMEOUT,
+            )
+            return True
+        except UserNotParticipantError:
+            return False
+        except Exception as e:
+            # Fail-open: if we can't determine membership, assume NOT
+            # a member so the caller proceeds with join/leave safely.
+            log.debug(
+                "Membership check failed for %s: %s – assuming not a member",
+                acc_label or "?",
+                e,
+            )
+            return False
+
+    # ================================================================ #
     #  Auto-join — master joins a channel automatically                #
     # ================================================================ #
 
@@ -622,12 +659,19 @@ class Reactor:
                 )
             return
 
-        # Public channel — resolve entity and join.
+        # Public channel — resolve entity, check membership, then join.
         try:
             entity = await asyncio.wait_for(
                 client.get_entity(channel_entity),
                 timeout=_RPC_TIMEOUT,
             )
+            # Smart membership check — skip if already joined.
+            if await self._is_member(client, entity, acc_label="master"):
+                title = getattr(entity, "title", None) or str(channel_entity)
+                log.info(
+                    "ℹ️ Master is already a member of %s. Skipping join.", title
+                )
+                return
             await asyncio.wait_for(
                 client(JoinChannelRequest(channel=entity)),
                 timeout=_RPC_TIMEOUT,
@@ -650,11 +694,23 @@ class Reactor:
     async def _join_client_to_channel(
         self, acc_id: str, client: TelegramClient, channel_entity: int | str
     ) -> None:
-        """Make a single client join a channel. Best-effort, non-fatal."""
+        """Make a single client join a channel. Best-effort, non-fatal.
+
+        Uses a smart membership check — if the account is already a
+        member, the join request is skipped entirely.
+        """
         try:
             entity = await asyncio.wait_for(
                 client.get_entity(channel_entity), timeout=_RPC_TIMEOUT
             )
+            # Smart membership check — skip duplicate joins.
+            if await self._is_member(client, entity, acc_label=acc_id[:8]):
+                log.debug(
+                    "ℹ️ Account %s already a member of %s. Skipping join.",
+                    acc_id[:8],
+                    channel_entity,
+                )
+                return
             await asyncio.wait_for(
                 client(JoinChannelRequest(channel=entity)),
                 timeout=_RPC_TIMEOUT,
@@ -674,7 +730,11 @@ class Reactor:
             await asyncio.sleep(0.5)  # light stagger to avoid flood
 
     async def auto_leave_channel(self, channel_entity: int | str) -> None:
-        """Make ALL connected accounts leave a channel."""
+        """Make ALL connected accounts leave a channel.
+
+        Uses a smart membership check — if the account is already NOT
+        a member, the leave request is skipped entirely.
+        """
         for acc_id, client in list(self.clients.items()):
             if not client.is_connected():
                 continue
@@ -682,6 +742,14 @@ class Reactor:
                 entity = await asyncio.wait_for(
                     client.get_entity(channel_entity), timeout=_RPC_TIMEOUT
                 )
+                # Smart membership check — skip if already left.
+                if not await self._is_member(client, entity, acc_label=acc_id[:8]):
+                    log.debug(
+                        "ℹ️ Account %s is already not in %s. Skipping leave.",
+                        acc_id[:8],
+                        channel_entity,
+                    )
+                    continue
                 await asyncio.wait_for(
                     client(LeaveChannelRequest(channel=entity)),
                     timeout=_RPC_TIMEOUT,
@@ -695,7 +763,11 @@ class Reactor:
             await asyncio.sleep(0.5)
 
     async def _leave_workers_from_channel(self, channel_entity: int | str) -> None:
-        """Make only WORKER accounts leave a channel (master stays)."""
+        """Make only WORKER accounts leave a channel (master stays).
+
+        Uses a smart membership check — if the worker is already NOT
+        a member, the leave request is skipped entirely.
+        """
         for acc_id, client in list(self.clients.items()):
             if acc_id == self.master_id:
                 continue  # master stays for monitoring
@@ -705,6 +777,14 @@ class Reactor:
                 entity = await asyncio.wait_for(
                     client.get_entity(channel_entity), timeout=_RPC_TIMEOUT
                 )
+                # Smart membership check — skip if already left.
+                if not await self._is_member(client, entity, acc_label=acc_id[:8]):
+                    log.debug(
+                        "ℹ️ Worker %s is already not in %s. Skipping leave.",
+                        acc_id[:8],
+                        channel_entity,
+                    )
+                    continue
                 await asyncio.wait_for(
                     client(LeaveChannelRequest(channel=entity)),
                     timeout=_RPC_TIMEOUT,
@@ -798,6 +878,155 @@ class Reactor:
             )
         except Exception:
             log.debug("Failed to send rebind success alert for %s", acc["name"])
+
+    # ================================================================ #
+    #  Aggressive Instant Self-Revive                                   #
+    # ================================================================ #
+
+    def _fire_instant_revive(self, acc_id: str, reason: str) -> None:
+        """Schedule an immediate background auto-rebind attempt.
+
+        Unlike the periodic health check, this fires **instantly** when
+        a fatal / severe error is detected — zero delay.
+
+        If the rebind succeeds the admin gets a special "Instant
+        Self-Revive" alert.  If it fails the account falls into the
+        normal circuit-breaker / failed state.
+        """
+        task = asyncio.create_task(
+            self._instant_revive_task(acc_id, reason)
+        )
+        self._bg_tasks.add(task)
+        task.add_done_callback(self._bg_tasks.discard)
+
+    async def _instant_revive_task(self, acc_id: str, reason: str) -> None:
+        """Background coroutine that attempts instant self-revive."""
+        log.info(
+            "🚨 Instant Self-Revive triggered for %s — reason: %s",
+            acc_id[:8],
+            reason,
+        )
+
+        ok = await self._try_auto_rebind(acc_id)
+
+        if ok:
+            # Send special instant-revive alert (distinct from normal
+            # rebind alert so the admin knows it was auto-triggered).
+            await self._send_instant_revive_alert(acc_id, reason)
+        else:
+            # Rebind failed — make sure the account is marked failed
+            # (it may already be if the caller did so; update_account_status
+            # is idempotent).
+            self.db.update_account_status(acc_id, "failed")
+            await self._send_health_alert(
+                acc_id,
+                f"Instant Self-Revive FAILED for reason: {reason}. "
+                f"Manual OTP/2FA re-authentication required.",
+            )
+
+    async def _send_instant_revive_alert(self, acc_id: str, reason: str) -> None:
+        """Notify the admin about a successful instant self-revive."""
+        if self._bot is None:
+            return
+
+        from config import PERMANENT_OWNER_ID
+
+        acc = self.db.get_account(acc_id)
+        name = acc["name"] if acc else acc_id[:8]
+
+        text = (
+            "🚨 *Instant Self-Revive Triggered & Successful!*\n\n"
+            f"• *Account:* {name}\n"
+            f"• *Reason:* {reason}\n"
+            f"• *Status:* Automatically revived and back "
+            f"online instantly!"
+        )
+        try:
+            await self._bot.send_message(
+                chat_id=PERMANENT_OWNER_ID,
+                text=text,
+                parse_mode="Markdown",
+            )
+        except Exception:
+            log.debug("Failed to send instant-revive alert for %s", name)
+
+    # ================================================================ #
+    #  Bulk rebind – attempt reconnect for all / failed accounts       #
+    # ================================================================ #
+
+    async def rebind_all_accounts(
+        self,
+        failed_only: bool = False,
+        progress_callback: Any = None,
+    ) -> dict[str, Any]:
+        """Attempt to reconnect all (or only failed) accounts using
+        their stored credentials.
+
+        *progress_callback* is an optional ``async def(done, total, name, ok)``
+        called after each account attempt — used by the bot UI to send
+        live progress edits.
+
+        Returns a summary dict::
+
+            {
+                "total": int,
+                "success": [{"id": str, "name": str}, ...],
+                "failed": [{"id": str, "name": str, "reason": str}, ...],
+            }
+        """
+        if failed_only:
+            accounts = self.db.get_failed_accounts()
+        else:
+            accounts = self.db.get_all_accounts()
+
+        total = len(accounts)
+        success_list: list[dict[str, str]] = []
+        failed_list: list[dict[str, str]] = []
+
+        for idx, acc in enumerate(accounts, 1):
+            acc_id = acc["id"]
+            acc_name = acc["name"]
+
+            # If already connected and healthy, count as success.
+            client = self.clients.get(acc_id)
+            if client is not None and client.is_connected():
+                try:
+                    await asyncio.wait_for(client.get_me(), timeout=_RPC_TIMEOUT)
+                    success_list.append({"id": acc_id, "name": acc_name})
+                    if progress_callback:
+                        await progress_callback(idx, total, acc_name, True)
+                    continue
+                except Exception:
+                    # Connection is stale — remove and try rebind.
+                    await self.remove_client(acc_id)
+
+            # Attempt rebind using stored session.
+            ok = await self._try_auto_rebind(acc_id)
+            if ok:
+                success_list.append({"id": acc_id, "name": acc_name})
+            else:
+                reason = "Session expired/revoked — needs manual OTP/2FA"
+                failed_list.append({"id": acc_id, "name": acc_name, "reason": reason})
+                # Ensure status is 'failed' in DB.
+                self.db.update_account_status(acc_id, "failed")
+
+            if progress_callback:
+                await progress_callback(idx, total, acc_name, ok)
+
+            # Small stagger to avoid flooding Telegram.
+            await asyncio.sleep(0.5)
+
+        log.info(
+            "Rebind-all complete: %d/%d succeeded, %d failed",
+            len(success_list),
+            total,
+            len(failed_list),
+        )
+        return {
+            "total": total,
+            "success": success_list,
+            "failed": failed_list,
+        }
 
     # ================================================================ #
     #  Reload helpers                                                  #
@@ -1263,6 +1492,11 @@ class Reactor:
                                 f"Auto-deactivated: disconnected {attempt_counts[acc_id]} "
                                 f"times during sweep {chat_id}/{msg_id}",
                             )
+                            # 🚨 Instant Self-Revive — fire background rebind.
+                            self._fire_instant_revive(
+                                acc_id,
+                                f"Disconnected {attempt_counts[acc_id]}x (circuit breaker)",
+                            )
                             circuit_broken.add(acc_id)
                             self._log_outcome(
                                 chat_id, msg_id, acc_id, "failed",
@@ -1337,6 +1571,11 @@ class Reactor:
                                 f"Auto-deactivated: {attempt_counts[acc_id]} "
                                 f"FloodWait errors during sweep {chat_id}/{msg_id}",
                             )
+                            # 🚨 Instant Self-Revive — fire background rebind.
+                            self._fire_instant_revive(
+                                acc_id,
+                                f"FloodWait {attempt_counts[acc_id]}x (circuit breaker)",
+                            )
                             circuit_broken.add(acc_id)
                             self._log_outcome(
                                 chat_id, msg_id, acc_id, "failed",
@@ -1358,14 +1597,22 @@ class Reactor:
                             acc_label,
                             e,
                         )
-                        self.db.update_account_status(acc_id, "failed")
                         await self.remove_client(acc_id)
-                        await self._send_health_alert(acc_id, str(e))
-                        permanently_failed.add(acc_id)
-                        self._log_outcome(
-                            chat_id, msg_id, acc_id, "failed",
-                            f"Session dead: {e}",
-                        )
+                        # Try auto-rebind before permanently failing.
+                        if await self._try_auto_rebind(acc_id):
+                            round_failures.add(acc_id)  # retry in next round
+                        else:
+                            self.db.update_account_status(acc_id, "failed")
+                            await self._send_health_alert(acc_id, str(e))
+                            # 🚨 Instant Self-Revive — fire background retry.
+                            self._fire_instant_revive(
+                                acc_id, f"Session dead: {e}"
+                            )
+                            permanently_failed.add(acc_id)
+                            self._log_outcome(
+                                chat_id, msg_id, acc_id, "failed",
+                                f"Session dead: {e}",
+                            )
 
                     except (
                         ChannelPrivateError,
@@ -1401,6 +1648,11 @@ class Reactor:
                                 f"errors ({type(e).__name__}) during sweep "
                                 f"{chat_id}/{msg_id}",
                             )
+                            # 🚨 Instant Self-Revive — fire background rebind.
+                            self._fire_instant_revive(
+                                acc_id,
+                                f"Transient {type(e).__name__} {attempt_counts[acc_id]}x",
+                            )
                             circuit_broken.add(acc_id)
                             self._log_outcome(
                                 chat_id, msg_id, acc_id, "failed",
@@ -1435,6 +1687,11 @@ class Reactor:
                                 acc_id,
                                 f"Auto-deactivated: {attempt_counts[acc_id]} unexpected "
                                 f"errors during sweep {chat_id}/{msg_id}",
+                            )
+                            # 🚨 Instant Self-Revive — fire background rebind.
+                            self._fire_instant_revive(
+                                acc_id,
+                                f"Unexpected errors {attempt_counts[acc_id]}x (circuit breaker)",
                             )
                             circuit_broken.add(acc_id)
                             self._log_outcome(
@@ -1653,6 +1910,11 @@ class Reactor:
                             f"Auto-deactivated: disconnected "
                             f"{attempt_counts[acc_id]} times (instant react)",
                         )
+                        # 🚨 Instant Self-Revive — fire background rebind.
+                        self._fire_instant_revive(
+                            acc_id,
+                            f"Disconnected {attempt_counts[acc_id]}x (instant react)",
+                        )
                         circuit_broken[acc_id] = "Disconnected (circuit breaker)"
                     else:
                         round_failures.add(acc_id)
@@ -1708,6 +1970,11 @@ class Reactor:
                             f"Auto-deactivated: {attempt_counts[acc_id]} "
                             f"FloodWait errors (instant react)",
                         )
+                        # 🚨 Instant Self-Revive — fire background rebind.
+                        self._fire_instant_revive(
+                            acc_id,
+                            f"FloodWait {attempt_counts[acc_id]}x (instant react)",
+                        )
                         circuit_broken[acc_id] = "FloodWait (circuit breaker)"
                     else:
                         log.warning(
@@ -1725,10 +1992,18 @@ class Reactor:
                         acc_id[:8],
                         e,
                     )
-                    self.db.update_account_status(acc_id, "failed")
                     await self.remove_client(acc_id)
-                    await self._send_health_alert(acc_id, str(e))
-                    permanently_failed[acc_id] = "Session revoked"
+                    # Try auto-rebind before permanently failing.
+                    if await self._try_auto_rebind(acc_id):
+                        round_failures.add(acc_id)  # retry in next round
+                    else:
+                        self.db.update_account_status(acc_id, "failed")
+                        await self._send_health_alert(acc_id, str(e))
+                        # 🚨 Instant Self-Revive — fire background retry.
+                        self._fire_instant_revive(
+                            acc_id, f"Session dead (instant react): {e}"
+                        )
+                        permanently_failed[acc_id] = "Session revoked"
 
                 except (
                     ChannelPrivateError,
@@ -1752,6 +2027,11 @@ class Reactor:
                             f"Auto-deactivated: {attempt_counts[acc_id]} "
                             f"transient errors (instant react)",
                         )
+                        # 🚨 Instant Self-Revive — fire background rebind.
+                        self._fire_instant_revive(
+                            acc_id,
+                            f"Transient {type(e).__name__} {attempt_counts[acc_id]}x (instant react)",
+                        )
                         circuit_broken[acc_id] = f"{type(e).__name__} (circuit breaker)"
                     else:
                         log.warning(
@@ -1773,6 +2053,11 @@ class Reactor:
                             acc_id,
                             f"Auto-deactivated: {attempt_counts[acc_id]} "
                             f"unexpected errors (instant react)",
+                        )
+                        # 🚨 Instant Self-Revive — fire background rebind.
+                        self._fire_instant_revive(
+                            acc_id,
+                            f"Unexpected {type(e).__name__} {attempt_counts[acc_id]}x (instant react)",
                         )
                         circuit_broken[acc_id] = f"{type(e).__name__} (circuit breaker)"
                     else:

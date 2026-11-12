@@ -188,6 +188,20 @@ class Database:
             log.exception("get_active_accounts failed")
             return []
 
+    def get_failed_accounts(self) -> list[dict[str, Any]]:
+        """Return only accounts with status ``'failed'``."""
+        try:
+            return (
+                self.client.table("accounts")
+                .select("*")
+                .eq("status", "failed")
+                .execute()
+                .data
+            )
+        except Exception:
+            log.exception("get_failed_accounts failed")
+            return []
+
     def update_account_status(self, account_id: str, status: str) -> None:
         try:
             (
@@ -269,12 +283,23 @@ class Database:
     def add_channel(
         self, channel_id: int, channel_name: str, added_by: int
     ) -> dict[str, Any]:
+        """Add a channel or reactivate a ghost record.
+
+        Uses ``upsert`` with ``on_conflict="channel_id"`` so that if an
+        old row with the same ``channel_id`` still exists (ghost record
+        from a failed delete or Supabase RLS edge case), it is cleanly
+        overwritten instead of crashing with error 23505.
+        """
         row = {
             "channel_id": channel_id,
             "channel_name": channel_name,
             "added_by": added_by,
         }
-        res = self.client.table("channels").insert(row).execute()
+        res = (
+            self.client.table("channels")
+            .upsert(row, on_conflict="channel_id")
+            .execute()
+        )
         self._cache.invalidate("channels")
         return res.data[0]
 
@@ -310,8 +335,25 @@ class Database:
             return None
 
     def delete_channel(self, channel_db_id: str) -> None:
+        """Hard-delete a channel by its UUID primary key.
+
+        Also removes any ghost rows that share the same ``channel_id``
+        (numeric Telegram ID) to prevent duplicate-key errors on
+        future re-addition.
+        """
         try:
+            # First, grab the Telegram channel_id so we can nuke ghosts.
+            ch = self.get_channel(channel_db_id)
+            tg_id = int(ch["channel_id"]) if ch else None
+
+            # Delete the target row by UUID.
             self.client.table("channels").delete().eq("id", channel_db_id).execute()
+
+            # Safety sweep: delete any remaining rows with the same
+            # Telegram channel_id (ghost / orphan records).
+            if tg_id is not None:
+                self.client.table("channels").delete().eq("channel_id", tg_id).execute()
+
             self._cache.invalidate("channels")
         except Exception:
             log.exception("delete_channel failed for %s", channel_db_id)

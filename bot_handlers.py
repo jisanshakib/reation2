@@ -172,6 +172,8 @@ def _accounts_kb(accounts: list[dict], can_add: bool) -> InlineKeyboardMarkup:
         )
     if can_add:
         rows.append([InlineKeyboardButton("➕ Add Account", callback_data="acc_add")])
+    if can_add:
+        rows.append([InlineKeyboardButton("⚡ Rebind All Accounts", callback_data="acc_rebind_all")])
     rows.append([_back_button()])
     return InlineKeyboardMarkup(rows)
 
@@ -1031,6 +1033,61 @@ async def _route_callback(query: Any, user_id: int, role: str | None, data: str)
                 reply_markup=InlineKeyboardMarkup([[_back_button(f"acc:{acc_id}")]]),
                 parse_mode="Markdown",
             )
+
+    # ─── Rebind All Accounts ──────────────────────────────────── #
+    elif data == "acc_rebind_all":
+        if not _can_manage_accounts(user_id):
+            await query.answer("⛔ Admins and Owner only", show_alert=True)
+            return
+
+        await query.edit_message_text(
+            "⚡ *Bulk Rebind — Starting…*\n\n"
+            "Testing and reconnecting all accounts.\n"
+            "Please wait ⏳",
+            parse_mode="Markdown",
+        )
+
+        progress_msg = query.message
+
+        async def _progress(done: int, total: int, name: str, ok: bool) -> None:
+            icon = "✅" if ok else "❌"
+            try:
+                await progress_msg.edit_text(
+                    f"⚡ *Bulk Rebind — Processing…*\n\n"
+                    f"{icon} `{name}`\n"
+                    f"Progress: *{done}/{total}* completed\n\n"
+                    f"⏳ Please wait…",
+                    parse_mode="Markdown",
+                )
+            except BadRequest:
+                pass  # "Message is not modified"
+            except Exception:
+                pass
+
+        result = await reactor.rebind_all_accounts(
+            failed_only=False,
+            progress_callback=_progress,
+        )
+
+        # Build final summary.
+        s_count = len(result["success"])
+        f_count = len(result["failed"])
+        lines = [
+            "⚡ *Bulk Rebind Complete!*\n",
+            f"✅ Success: *{s_count}*",
+            f"❌ Failed: *{f_count}*",
+            f"📊 Total: *{result['total']}*",
+        ]
+        if result["failed"]:
+            lines.append("\n*Needs Manual Attention:*")
+            for f in result["failed"]:
+                lines.append(f"• 🔴 `{f['name']}` — {f['reason']}")
+
+        await progress_msg.edit_text(
+            "\n".join(lines),
+            reply_markup=InlineKeyboardMarkup([[_back_button("accounts")]]),
+            parse_mode="Markdown",
+        )
 
     # ─── Skip phone (removed — no longer needed) ──────────────── #
     elif data == "skip_phone":
