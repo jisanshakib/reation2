@@ -1736,10 +1736,10 @@ class Reactor:
                     max(0, retry_round - 1),
                 )
 
-            # ── Step C: Post-reaction auto-leave (workers only) ──────
-            # Master stays in the channel for continued monitoring.
-            # Workers leave to keep their channel list clean.
-            await self._leave_workers_from_channel(chat_id)
+            # ── Step C: Workers stay joined ───────────────────────────
+            # Workers remain in target channels permanently until the
+            # channel is manually removed from the bot database.
+            # Auto-leave is only used by instant_react (ad-hoc posts).
 
     async def _resolve_peer(
         self, acc_id: str, client: TelegramClient, chat_id: int | str
