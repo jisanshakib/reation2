@@ -1,22 +1,22 @@
-"""Auto-Reaction Engine (v5) – fully non-blocking, with peer caching,
+"""Auto-Reaction Engine (v6) – fully non-blocking, with peer caching,
 per-account flood-cooldown tracking, fire-and-forget reaction sweeps,
 periodic account-health monitoring with owner alerts, instant reaction
-for arbitrary post links, and entity resolution for channels/usernames.
+for arbitrary post links, entity resolution for channels/usernames,
+emoji fallback/multi-try, and a reliable background event listener.
 
-v5 changes
+v6 changes
 ──────────
-• ``instant_react(post_link)`` – triggers ALL active accounts to react
-  to any valid Telegram post link without requiring pre-registration.
-• ``resolve_channel_entity(link_or_username)`` – resolves a t.me link
-  or @username to a (channel_id, channel_title) tuple via Telethon.
-• ``resolve_user_id(username)`` – resolves a @username to a numeric
-  Telegram user-ID via Telethon.
-• Fixed background listener: ``events.NewMessage`` handler is now
-  properly registered with ``chats=`` filter targeting all configured
-  channels, and re-registered whenever channels are reloaded.
-• Graceful handling when 0 clients are connected (no crash, clear logs).
-• ``_health_check_loop`` properly re-raises ``CancelledError``.
-• Early exit in ``_run_health_check`` when there are no clients.
+• **Fixed background event listener**: each Telethon client now calls
+  ``client.catch_up()`` after connect so the update loop is actually
+  running and events.NewMessage fires.  Handler is stored as a bound
+  reference per-client so it can be reliably removed / re-added.
+  A dedicated ``_client_keepalive_loop`` keeps every client's update
+  receiver alive and reconnects if it drops.
+• **Emoji fallback & multi-try**: ``_try_react_with_fallback()`` loops
+  through all configured emojis in shuffled order.  If one emoji
+  fails with ReactionInvalidError / MsgIdInvalidError, it immediately
+  tries the next.  Stops on first success.  Used by both background
+  sweeps and instant reactions.
 """
 
 from __future__ import annotations
@@ -32,6 +32,7 @@ from typing import TYPE_CHECKING, Any
 from telethon import TelegramClient, events
 from telethon.errors import (
     AuthKeyUnregisteredError,
+    MsgIdInvalidError,
     ReactionInvalidError,
     ChannelPrivateError,
     ChatWriteForbiddenError,
@@ -58,8 +59,15 @@ _MAX_CONCURRENT_SWEEPS = 5
 # Timeout (seconds) for a single Telethon RPC call.
 _RPC_TIMEOUT = 15.0
 
+# How often (seconds) the keepalive loop checks client connectivity.
+_KEEPALIVE_INTERVAL = 60
+
 # Telethon errors that mean the session is dead / revoked.
 _AUTH_FATAL_ERRORS = (AuthKeyUnregisteredError, UserDeactivatedBanError)
+
+# Telethon errors that mean "this emoji is not valid for this channel
+# or the message ID is wrong" — the next emoji should be tried.
+_EMOJI_RETRY_ERRORS = (ReactionInvalidError, MsgIdInvalidError)
 
 # Regex for parsing Telegram post links.
 _POST_LINK_RE = re.compile(
@@ -81,6 +89,9 @@ class Reactor:
 
         # account_id → TelegramClient
         self.clients: dict[str, TelegramClient] = {}
+
+        # account_id → handler callback (so we can remove it reliably).
+        self._handlers: dict[str, Any] = {}
 
         # Fast-path copies of DB state (refreshed via reload_*).
         self.target_channels: set[int] = set()
@@ -105,6 +116,9 @@ class Reactor:
         # Health monitor settings.
         self._health_interval = health_interval
         self._health_task: asyncio.Task | None = None
+
+        # Keepalive loop task.
+        self._keepalive_task: asyncio.Task | None = None
 
         # Telegram Bot reference – set via set_bot(), used to send alerts.
         self._bot: Bot | None = None
@@ -146,6 +160,8 @@ class Reactor:
 
         # Launch the periodic health-check loop.
         self._health_task = asyncio.create_task(self._health_check_loop())
+        # Launch the keepalive loop.
+        self._keepalive_task = asyncio.create_task(self._client_keepalive_loop())
 
         log.info(
             "Reactor started – %d clients, %d channels, %d emojis, "
@@ -157,8 +173,8 @@ class Reactor:
         )
 
     async def stop(self) -> None:
-        """Cancel the health monitor, background sweeps, and disconnect
-        every Telethon client."""
+        """Cancel the health monitor, keepalive, background sweeps, and
+        disconnect every Telethon client."""
         # Cancel health task.
         if self._health_task is not None:
             self._health_task.cancel()
@@ -167,6 +183,15 @@ class Reactor:
             except (asyncio.CancelledError, Exception):
                 pass
             self._health_task = None
+
+        # Cancel keepalive task.
+        if self._keepalive_task is not None:
+            self._keepalive_task.cancel()
+            try:
+                await self._keepalive_task
+            except (asyncio.CancelledError, Exception):
+                pass
+            self._keepalive_task = None
 
         # Cancel sweep tasks.
         for task in self._bg_tasks:
@@ -196,8 +221,8 @@ class Reactor:
             self.db.update_account_status(account["id"], "failed")
 
     async def add_client(self, account: dict) -> None:
-        """Create a Telethon client, connect, and register the new-message
-        handler.  Raises on failure."""
+        """Create a Telethon client, connect, register the new-message
+        handler, and start receiving updates.  Raises on failure."""
         acc_id = account["id"]
         session = StringSession(account["session_str"])
         client = TelegramClient(
@@ -217,33 +242,69 @@ class Reactor:
             await client.disconnect()
             return
 
-        # Register the new-message event handler for target channels.
-        # If target_channels is empty, we still register a catch-all
-        # handler so we can dynamically filter later.
-        self._register_event_handler(client)
+        # Register the new-message event handler.
+        self._register_event_handler(acc_id, client)
+
+        # ── CRITICAL: kick-start the update receiver ─────────────
+        # Without catch_up() Telethon connects but never processes
+        # incoming updates, so events.NewMessage never fires.
+        try:
+            await asyncio.wait_for(client.catch_up(), timeout=_RPC_TIMEOUT)
+            log.info(
+                "Account %s (%s): catch_up complete – update receiver active.",
+                account["name"],
+                acc_id,
+            )
+        except Exception as e:
+            # catch_up can fail on fresh sessions – not fatal, the
+            # update loop may still work for *new* messages.
+            log.warning(
+                "Account %s (%s): catch_up raised %s – continuing anyway.",
+                account["name"],
+                acc_id,
+                e,
+            )
 
         self.clients[acc_id] = client
         self.db.update_account_status(acc_id, "active")
-        log.info("Connected account %s (%s)", account["name"], acc_id)
+        log.info("Connected account %s (%s) – event listener registered.", account["name"], acc_id)
 
-    def _register_event_handler(self, client: TelegramClient) -> None:
-        """Register or re-register the NewMessage handler on a client.
-        Uses a catch-all handler and filters inside _maybe_dispatch_sweep
-        so that channel-list changes don't require re-registering handlers."""
-        # Remove any previously registered handlers to avoid duplicates.
-        client.remove_event_handler(self._on_new_message)
+    def _register_event_handler(self, acc_id: str, client: TelegramClient) -> None:
+        """Register (or re-register) the NewMessage handler on *client*.
 
-        @client.on(events.NewMessage())
-        async def handler(event: events.NewMessage.Event) -> None:
-            await self._on_new_message(event)
+        We store one handler per account so we can cleanly remove it
+        later.  The handler is a catch-all — channel filtering happens
+        at runtime inside ``_maybe_dispatch_sweep`` so that adding or
+        removing target channels takes effect immediately without having
+        to touch event registrations.
+        """
+        # Remove the old handler for this account if it exists.
+        old = self._handlers.pop(acc_id, None)
+        if old is not None:
+            try:
+                client.remove_event_handler(old, events.NewMessage)
+            except Exception:
+                pass
 
-    async def _on_new_message(self, event: events.NewMessage.Event) -> None:
-        """Central handler for new messages across all clients."""
-        await self._maybe_dispatch_sweep(event)
+        # Build a per-account handler that carries the acc_id.
+        async def _handler(event: events.NewMessage.Event) -> None:
+            try:
+                await self._maybe_dispatch_sweep(event)
+            except Exception:
+                log.exception(
+                    "Unhandled error in NewMessage handler (account %s)",
+                    acc_id[:8],
+                )
+
+        client.add_event_handler(_handler, events.NewMessage())
+        self._handlers[acc_id] = _handler
+        log.debug("Event handler registered for account %s", acc_id[:8])
 
     async def remove_client(self, account_id: str) -> None:
         """Disconnect and forget a client."""
         client = self.clients.pop(account_id, None)
+        # Remove handler reference.
+        self._handlers.pop(account_id, None)
         if client is not None:
             try:
                 await asyncio.wait_for(client.disconnect(), timeout=5.0)
@@ -252,6 +313,36 @@ class Reactor:
         stale = [k for k in self._peer_cache if k[0] == account_id]
         for k in stale:
             del self._peer_cache[k]
+
+    # ================================================================ #
+    #  Keepalive loop – ensures event receivers stay alive              #
+    # ================================================================ #
+
+    async def _client_keepalive_loop(self) -> None:
+        """Periodically verify every client is still connected and its
+        update-receive task hasn't silently died.  If a client dropped,
+        reconnect it in-place so the NewMessage handler keeps firing."""
+        try:
+            while True:
+                await asyncio.sleep(_KEEPALIVE_INTERVAL)
+                for acc_id, client in list(self.clients.items()):
+                    try:
+                        if not client.is_connected():
+                            log.warning(
+                                "Keepalive: client %s disconnected – reconnecting.",
+                                acc_id[:8],
+                            )
+                            acc = self.db.get_account(acc_id)
+                            await self.remove_client(acc_id)
+                            if acc and acc["status"] == "active":
+                                await self._safe_add_client(acc)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        log.exception("Keepalive: error for %s", acc_id[:8])
+        except asyncio.CancelledError:
+            log.debug("Keepalive loop cancelled.")
+            raise
 
     # ================================================================ #
     #  Reload helpers                                                  #
@@ -265,6 +356,7 @@ class Reactor:
     async def reload_emojis(self) -> None:
         rows = self.db.get_emojis()
         self.allowed_emojis = [r["emoji"] for r in rows]
+        log.info("Emojis reloaded: %d configured", len(self.allowed_emojis))
 
     async def reload_accounts(self) -> None:
         """Synchronise running clients with the DB."""
@@ -282,7 +374,7 @@ class Reactor:
             )
 
     # ================================================================ #
-    #  Health monitor (Feature 4)                                      #
+    #  Health monitor                                                  #
     # ================================================================ #
 
     async def _health_check_loop(self) -> None:
@@ -383,6 +475,80 @@ class Reactor:
             log.exception("Failed to send health alert for %s", name)
 
     # ================================================================ #
+    #  Emoji fallback helper                                           #
+    # ================================================================ #
+
+    async def _try_react_with_fallback(
+        self,
+        client: TelegramClient,
+        peer: object,
+        msg_id: int,
+        emojis: list[str],
+        acc_label: str,
+    ) -> str | None:
+        """Try to send a reaction using each emoji in *emojis* (shuffled)
+        until one succeeds.
+
+        Returns the successful emoji string, or ``None`` if all failed.
+
+        Raises:
+            FloodWaitError — caller must handle cooldown.
+            _AUTH_FATAL_ERRORS — caller must handle session death.
+            ChannelPrivateError, ChatWriteForbiddenError, PeerIdInvalidError
+                — caller must handle (retrying emojis won't help).
+        """
+        # Shuffle so we don't always hammer the same emoji first.
+        candidates = list(emojis)
+        random.shuffle(candidates)
+
+        last_error: Exception | None = None
+
+        for emoji in candidates:
+            try:
+                await asyncio.wait_for(
+                    client(
+                        SendReactionRequest(
+                            peer=peer,
+                            msg_id=msg_id,
+                            reaction=[ReactionEmoji(emoticon=emoji)],
+                        )
+                    ),
+                    timeout=_RPC_TIMEOUT,
+                )
+                log.debug("  %s reacted with %s", acc_label, emoji)
+                return emoji  # ✅ success — stop trying
+
+            except _EMOJI_RETRY_ERRORS as e:
+                # This emoji is not valid for this channel / message.
+                # Try the next one.
+                log.debug(
+                    "  %s: emoji %s rejected (%s) – trying next",
+                    acc_label,
+                    emoji,
+                    type(e).__name__,
+                )
+                last_error = e
+                continue
+
+            except asyncio.TimeoutError as e:
+                log.debug(
+                    "  %s: emoji %s timed out – trying next", acc_label, emoji
+                )
+                last_error = e
+                continue
+
+            # All other errors propagate to caller (FloodWait, AuthKey, etc.).
+
+        # All emojis exhausted.
+        log.warning(
+            "  %s: all %d emojis failed. Last error: %s",
+            acc_label,
+            len(candidates),
+            last_error,
+        )
+        return None
+
+    # ================================================================ #
     #  Core reaction logic                                             #
     # ================================================================ #
 
@@ -402,6 +568,9 @@ class Reactor:
                 self._processed.popitem(last=False)
 
         if not self.allowed_emojis:
+            log.debug(
+                "New post %s/%s ignored – no emojis configured.", chat_id, msg_id
+            )
             return
 
         log.info(
@@ -415,12 +584,19 @@ class Reactor:
         task.add_done_callback(self._bg_tasks.discard)
 
     async def _sweep_reactions(self, chat_id: int, msg_id: int) -> None:
+        """React to a post across all connected accounts with emoji
+        fallback: if the first emoji fails, try the next, and so on."""
         async with self._sweep_sem:
             log.info(
-                "Sweep %s/%s – %d accounts", chat_id, msg_id, len(self.clients)
+                "Sweep %s/%s – %d accounts, %d emojis",
+                chat_id,
+                msg_id,
+                len(self.clients),
+                len(self.allowed_emojis),
             )
 
             for acc_id, client in list(self.clients.items()):
+                # ── Cooldown check ───────────────────────────────
                 cooldown_until = self._cooldowns.get(acc_id, 0)
                 now = time.monotonic()
                 if now < cooldown_until:
@@ -428,52 +604,58 @@ class Reactor:
                     log.debug("Account %s in cooldown for %.1fs", acc_id[:8], wait)
                     await asyncio.sleep(wait)
 
-                emoji = random.choice(self.allowed_emojis)
+                acc_label = acc_id[:8]
 
                 try:
                     peer = await self._resolve_peer(acc_id, client, chat_id)
-                    await asyncio.wait_for(
-                        client(
-                            SendReactionRequest(
-                                peer=peer,
-                                msg_id=msg_id,
-                                reaction=[ReactionEmoji(emoticon=emoji)],
-                            )
-                        ),
-                        timeout=_RPC_TIMEOUT,
+
+                    result = await self._try_react_with_fallback(
+                        client=client,
+                        peer=peer,
+                        msg_id=msg_id,
+                        emojis=self.allowed_emojis,
+                        acc_label=acc_label,
                     )
-                    log.debug("  %s reacted with %s", acc_id[:8], emoji)
+                    if result is None:
+                        log.warning(
+                            "Sweep: %s failed all emojis for %s/%s",
+                            acc_label,
+                            chat_id,
+                            msg_id,
+                        )
 
                 except FloodWaitError as e:
                     self._cooldowns[acc_id] = time.monotonic() + e.seconds
                     log.warning(
                         "FloodWait %ds for %s – cooldown set",
                         e.seconds,
-                        acc_id[:8],
+                        acc_label,
                     )
 
                 except _AUTH_FATAL_ERRORS as e:
-                    log.warning("Session dead for %s during sweep: %s", acc_id[:8], e)
+                    log.warning("Session dead for %s during sweep: %s", acc_label, e)
                     self.db.update_account_status(acc_id, "failed")
                     await self.remove_client(acc_id)
                     await self._send_health_alert(acc_id, str(e))
                     continue  # skip the 1-s delay for a removed client
 
                 except (
-                    ReactionInvalidError,
                     ChannelPrivateError,
                     ChatWriteForbiddenError,
                     PeerIdInvalidError,
                 ) as e:
-                    log.warning("Reaction error for %s: %s", acc_id[:8], e)
+                    log.warning("Reaction error for %s: %s", acc_label, e)
 
                 except asyncio.TimeoutError:
                     log.warning(
-                        "RPC timeout for %s on %s/%s", acc_id[:8], chat_id, msg_id
+                        "RPC timeout for %s on %s/%s (peer resolve)",
+                        acc_label,
+                        chat_id,
+                        msg_id,
                     )
 
                 except Exception:
-                    log.exception("Unexpected error for %s", acc_id[:8])
+                    log.exception("Unexpected error for %s", acc_label)
 
                 # Strict 1-second delay between accounts.
                 await asyncio.sleep(1)
@@ -496,6 +678,7 @@ class Reactor:
     # ================================================================ #
 
     async def check_react(self, account_id: str, post_link: str) -> str:
+        """Single-account check with emoji fallback."""
         client = self.clients.get(account_id)
         if client is None:
             return "❌ Account is not connected."
@@ -506,6 +689,8 @@ class Reactor:
 
         raw_id, username, msg_id_str = match.groups()
         msg_id = int(msg_id_str)
+
+        emojis = list(self.allowed_emojis) if self.allowed_emojis else ["👍"]
 
         try:
             if raw_id:
@@ -518,18 +703,20 @@ class Reactor:
                     client.get_input_entity(username), timeout=_RPC_TIMEOUT
                 )
 
-            emoji = random.choice(self.allowed_emojis) if self.allowed_emojis else "👍"
-            await asyncio.wait_for(
-                client(
-                    SendReactionRequest(
-                        peer=peer,
-                        msg_id=msg_id,
-                        reaction=[ReactionEmoji(emoticon=emoji)],
-                    )
-                ),
-                timeout=_RPC_TIMEOUT,
+            result = await self._try_react_with_fallback(
+                client=client,
+                peer=peer,
+                msg_id=msg_id,
+                emojis=emojis,
+                acc_label=account_id[:8],
             )
-            return f"✅ Reacted with {emoji} successfully!"
+            if result:
+                return f"✅ Reacted with {result} successfully!"
+            return "❌ All emojis failed for this post."
+
+        except FloodWaitError as e:
+            self._cooldowns[account_id] = time.monotonic() + e.seconds
+            return f"❌ FloodWait: please wait {e.seconds}s."
         except asyncio.TimeoutError:
             return "❌ Request timed out."
         except Exception as e:
@@ -541,9 +728,9 @@ class Reactor:
 
     async def instant_react(self, post_link: str) -> str:
         """Parse a Telegram post link, then trigger ALL active/connected
-        accounts to react to it.  The channel does NOT need to be in the
-        target-channels list.
+        accounts to react to it with emoji fallback.
 
+        The channel does NOT need to be in the target-channels list.
         Returns a human-readable status summary.
         """
         match = _POST_LINK_RE.match(post_link.strip())
@@ -574,8 +761,6 @@ class Reactor:
                 )
                 await asyncio.sleep(wait)
 
-            emoji = random.choice(self.allowed_emojis)
-
             try:
                 # Resolve the entity for this specific account.
                 if raw_id:
@@ -588,18 +773,19 @@ class Reactor:
                         client.get_input_entity(username), timeout=_RPC_TIMEOUT
                     )
 
-                await asyncio.wait_for(
-                    client(
-                        SendReactionRequest(
-                            peer=peer,
-                            msg_id=msg_id,
-                            reaction=[ReactionEmoji(emoticon=emoji)],
-                        )
-                    ),
-                    timeout=_RPC_TIMEOUT,
+                result = await self._try_react_with_fallback(
+                    client=client,
+                    peer=peer,
+                    msg_id=msg_id,
+                    emojis=self.allowed_emojis,
+                    acc_label=acc_id[:8],
                 )
-                log.info("Instant: %s reacted with %s", acc_id[:8], emoji)
-                success += 1
+                if result:
+                    log.info("Instant: %s reacted with %s", acc_id[:8], result)
+                    success += 1
+                else:
+                    failed += 1
+                    errors.append("All emojis rejected")
 
             except FloodWaitError as e:
                 self._cooldowns[acc_id] = time.monotonic() + e.seconds
@@ -619,7 +805,6 @@ class Reactor:
                 continue  # skip delay
 
             except (
-                ReactionInvalidError,
                 ChannelPrivateError,
                 ChatWriteForbiddenError,
                 PeerIdInvalidError,
@@ -642,7 +827,7 @@ class Reactor:
             await asyncio.sleep(1)
 
         # Build summary.
-        lines = [f"⚡ *Instant Reaction Complete*\n"]
+        lines = ["⚡ *Instant Reaction Complete*\n"]
         lines.append(f"✅ Success: {success}  |  ❌ Failed: {failed}")
         if errors:
             # Show unique errors, max 5.
