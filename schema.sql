@@ -13,8 +13,13 @@ CREATE TABLE IF NOT EXISTS accounts (
     session_str TEXT         NOT NULL,
     status      TEXT         NOT NULL DEFAULT 'active'
                              CHECK (status IN ('active', 'failed')),
+    is_master   BOOLEAN      NOT NULL DEFAULT false,
     created_at  TIMESTAMPTZ  NOT NULL DEFAULT now()
 );
+
+-- Ensure at most one master account at a time.
+CREATE UNIQUE INDEX IF NOT EXISTS accounts_single_master
+    ON accounts (is_master) WHERE is_master = true;
 
 CREATE TABLE IF NOT EXISTS channels (
     id            UUID DEFAULT gen_random_uuid() PRIMARY KEY,
@@ -41,9 +46,11 @@ CREATE TABLE IF NOT EXISTS users_roles (
 );
 
 -- ============================================================
--- MIGRATION from v2 (single 'admin' role):
+-- MIGRATION from v6 → v7 (add is_master column):
 --
---   ALTER TABLE users_roles DROP CONSTRAINT users_roles_role_check;
---   ALTER TABLE users_roles ADD CONSTRAINT users_roles_role_check
---       CHECK (role IN ('owner', 'admin', 'moderator'));
+--   ALTER TABLE accounts
+--       ADD COLUMN IF NOT EXISTS is_master BOOLEAN NOT NULL DEFAULT false;
+--
+--   CREATE UNIQUE INDEX IF NOT EXISTS accounts_single_master
+--       ON accounts (is_master) WHERE is_master = true;
 -- ============================================================

@@ -1,11 +1,12 @@
-"""Supabase database helper (v4) – CRUD for accounts, channels, emojis,
+"""Supabase database helper (v7) – CRUD for accounts, channels, emojis,
 and user roles, with a lightweight in-memory TTL cache to eliminate
 response lag on hot-path reads (channels, emojis, role lookups).
 
-v4 changes
+v7 changes
 ──────────
-• ``ensure_owner_role()`` – upserts the permanent owner row on every
-  startup so the bot never boots without an authorised user.
+• ``is_master`` column support: ``set_master_account()``,
+  ``get_master_account()``, ``clear_master_account()``.
+• ``add_account()`` now accepts optional ``is_master`` flag.
 • All public methods wrapped in try/except with logging so callers
   never see unhandled DB exceptions.
 """
@@ -65,7 +66,7 @@ class Database:
         self._cache = _TTLCache(default_ttl=30.0)
 
     # ================================================================ #
-    #  Owner bootstrap (v4)                                            #
+    #  Owner bootstrap                                                 #
     # ================================================================ #
 
     def ensure_owner_role(self, owner_id: int) -> None:
@@ -105,6 +106,7 @@ class Database:
         api_id: str,
         api_hash: str,
         session_str: str,
+        is_master: bool = False,
     ) -> dict[str, Any]:
         """Insert a new account and return its row."""
         row = {
@@ -115,7 +117,11 @@ class Database:
             "api_hash": api_hash,
             "session_str": session_str,
             "status": "active",
+            "is_master": is_master,
         }
+        # If registering as master, clear the old master first.
+        if is_master:
+            self.clear_master_account()
         res = self.client.table("accounts").insert(row).execute()
         return res.data[0]
 
@@ -188,6 +194,51 @@ class Database:
             self.client.table("accounts").delete().eq("id", account_id).execute()
         except Exception:
             log.exception("delete_account failed for %s", account_id)
+
+    # ── Master account management ─────────────────────────────────── #
+
+    def get_master_account(self) -> dict[str, Any] | None:
+        """Return the account row with ``is_master=true``, or ``None``."""
+        try:
+            res = (
+                self.client.table("accounts")
+                .select("*")
+                .eq("is_master", True)
+                .limit(1)
+                .execute()
+            )
+            return res.data[0] if res.data else None
+        except Exception:
+            log.exception("get_master_account failed")
+            return None
+
+    def set_master_account(self, account_id: str) -> None:
+        """Promote *account_id* to master, demoting any previous master."""
+        try:
+            # Clear old master(s).
+            self.clear_master_account()
+            # Set the new one.
+            (
+                self.client.table("accounts")
+                .update({"is_master": True})
+                .eq("id", account_id)
+                .execute()
+            )
+            log.info("Master account set to %s", account_id)
+        except Exception:
+            log.exception("set_master_account failed for %s", account_id)
+
+    def clear_master_account(self) -> None:
+        """Demote all master accounts back to worker."""
+        try:
+            (
+                self.client.table("accounts")
+                .update({"is_master": False})
+                .eq("is_master", True)
+                .execute()
+            )
+        except Exception:
+            log.exception("clear_master_account failed")
 
     # ================================================================ #
     #  Channels  (cached)                                              #

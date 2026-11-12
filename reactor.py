@@ -1,22 +1,34 @@
-"""Auto-Reaction Engine (v6) – fully non-blocking, with peer caching,
-per-account flood-cooldown tracking, fire-and-forget reaction sweeps,
-periodic account-health monitoring with owner alerts, instant reaction
-for arbitrary post links, entity resolution for channels/usernames,
-emoji fallback/multi-try, and a reliable background event listener.
+"""Auto-Reaction Engine (v7) – Master-Worker architecture.
 
-v6 changes
+Only the **Master Account** monitors target channels (event listener +
+fast 7-second fallback poll).  When a new post is detected the master
+dispatches reactions across ALL connected accounts (master + workers).
+Worker accounts stay idle until dispatched — no event handlers, no
+catch_up — which minimises Telegram rate-limit exposure.
+
+v7 changes
 ──────────
-• **Fixed background event listener**: each Telethon client now calls
-  ``client.catch_up()`` after connect so the update loop is actually
-  running and events.NewMessage fires.  Handler is stored as a bound
-  reference per-client so it can be reliably removed / re-added.
-  A dedicated ``_client_keepalive_loop`` keeps every client's update
-  receiver alive and reconnects if it drops.
-• **Emoji fallback & multi-try**: ``_try_react_with_fallback()`` loops
-  through all configured emojis in shuffled order.  If one emoji
-  fails with ReactionInvalidError / MsgIdInvalidError, it immediately
-  tries the next.  Stops on first success.  Used by both background
-  sweeps and instant reactions.
+• **Master-Worker split**: one account is designated ``is_master``
+  in the database.  ``start()`` reads this, stores ``self.master_id``,
+  and only the master gets a NewMessage event handler + catch_up.
+• **Fallback poll loop**: ``_master_poll_loop()`` runs every 7 s on
+  the master client, calling ``get_messages`` on each target channel
+  so new posts are never missed even if the event handler stalls.
+• **Auto-join**: ``auto_join_channel()`` makes the master (or any
+  available client) join a channel automatically when it is added.
+  Supports public channels and private invite links.
+• **reload_master()**: hot-swap the master at runtime from the bot UI
+  without restarting the process.
+• ``_get_any_client()`` now prefers the master client.
+• Keepalive loop prioritises master reconnection.
+
+Preserved from v6
+──────────────────
+• Emoji fallback / multi-try (``_try_react_with_fallback``).
+• Instant reaction for arbitrary post links.
+• Entity resolution for channels / usernames / user IDs.
+• Health-check loop with owner DM alerts.
+• Peer caching, per-account flood cooldowns, FIFO dedup.
 """
 
 from __future__ import annotations
@@ -41,7 +53,11 @@ from telethon.errors import (
     UserDeactivatedBanError,
 )
 from telethon.sessions import StringSession
-from telethon.tl.functions.messages import SendReactionRequest
+from telethon.tl.functions.channels import JoinChannelRequest
+from telethon.tl.functions.messages import (
+    ImportChatInviteRequest,
+    SendReactionRequest,
+)
 from telethon.tl.types import ReactionEmoji
 
 if TYPE_CHECKING:
@@ -62,6 +78,9 @@ _RPC_TIMEOUT = 15.0
 # How often (seconds) the keepalive loop checks client connectivity.
 _KEEPALIVE_INTERVAL = 60
 
+# How often (seconds) the master fallback poll checks for new posts.
+_POLL_INTERVAL = 7
+
 # Telethon errors that mean the session is dead / revoked.
 _AUTH_FATAL_ERRORS = (AuthKeyUnregisteredError, UserDeactivatedBanError)
 
@@ -79,10 +98,18 @@ _CHANNEL_LINK_RE = re.compile(
     r"https?://t\.me/(?:c/(\d+)|([a-zA-Z0-9_]+))(?:/\d+)?$"
 )
 
+# Regex for extracting invite hashes from private channel links.
+_INVITE_HASH_RE = re.compile(
+    r"https?://t\.me/(?:\+|joinchat/)([a-zA-Z0-9_-]+)"
+)
+
 
 class Reactor:
-    """Manages Telethon user-clients, listens for new messages in target
-    channels, dispatches emoji reactions, and monitors account health."""
+    """Manages Telethon user-clients with a Master-Worker architecture.
+
+    The Master Account monitors target channels and dispatches reactions
+    across all connected accounts (master + workers).
+    """
 
     def __init__(self, db: Database, health_interval: int = 300) -> None:
         self.db = db
@@ -90,7 +117,10 @@ class Reactor:
         # account_id → TelegramClient
         self.clients: dict[str, TelegramClient] = {}
 
-        # account_id → handler callback (so we can remove it reliably).
+        # Master account tracking.
+        self.master_id: str | None = None
+
+        # account_id → handler callback (only master gets one).
         self._handlers: dict[str, Any] = {}
 
         # Fast-path copies of DB state (refreshed via reload_*).
@@ -120,8 +150,22 @@ class Reactor:
         # Keepalive loop task.
         self._keepalive_task: asyncio.Task | None = None
 
+        # Master poll loop task.
+        self._poll_task: asyncio.Task | None = None
+
         # Telegram Bot reference – set via set_bot(), used to send alerts.
         self._bot: Bot | None = None
+
+    # ================================================================ #
+    #  Master client property                                          #
+    # ================================================================ #
+
+    @property
+    def master_client(self) -> TelegramClient | None:
+        """Return the master TelegramClient, or None."""
+        if self.master_id is None:
+            return None
+        return self.clients.get(self.master_id)
 
     # ================================================================ #
     #  Bot reference (for sending owner alerts)                        #
@@ -142,6 +186,18 @@ class Reactor:
         await self.reload_channels()
         await self.reload_emojis()
 
+        # Identify the master account from DB.
+        master_row = self.db.get_master_account()
+        if master_row:
+            self.master_id = master_row["id"]
+            log.info("Master account identified: %s (%s)", master_row["name"], self.master_id)
+        else:
+            self.master_id = None
+            log.warning(
+                "No master account configured. Background monitoring "
+                "will not work until a master is set."
+            )
+
         accounts = self.db.get_active_accounts()
 
         if not accounts:
@@ -158,23 +214,36 @@ class Reactor:
                 if isinstance(res, Exception):
                     log.error("Startup connect failed for %s: %s", acc["name"], res)
 
+        # Launch the master fallback poll loop.
+        self._start_poll_loop()
+
         # Launch the periodic health-check loop.
         self._health_task = asyncio.create_task(self._health_check_loop())
         # Launch the keepalive loop.
         self._keepalive_task = asyncio.create_task(self._client_keepalive_loop())
 
         log.info(
-            "Reactor started – %d clients, %d channels, %d emojis, "
-            "health interval %ds",
+            "Reactor started – %d clients, master=%s, %d channels, "
+            "%d emojis, health interval %ds",
             len(self.clients),
+            self.master_id[:8] if self.master_id else "NONE",
             len(self.target_channels),
             len(self.allowed_emojis),
             self._health_interval,
         )
 
     async def stop(self) -> None:
-        """Cancel the health monitor, keepalive, background sweeps, and
-        disconnect every Telethon client."""
+        """Cancel the health monitor, keepalive, poll loop, background
+        sweeps, and disconnect every Telethon client."""
+        # Cancel poll task.
+        if self._poll_task is not None:
+            self._poll_task.cancel()
+            try:
+                await self._poll_task
+            except (asyncio.CancelledError, Exception):
+                pass
+            self._poll_task = None
+
         # Cancel health task.
         if self._health_task is not None:
             self._health_task.cancel()
@@ -221,15 +290,20 @@ class Reactor:
             self.db.update_account_status(account["id"], "failed")
 
     async def add_client(self, account: dict) -> None:
-        """Create a Telethon client, connect, register the new-message
-        handler, and start receiving updates.  Raises on failure."""
+        """Create a Telethon client, connect it.
+
+        If the account is the master, register the new-message handler
+        and call catch_up().  Workers only connect — no handler, no
+        catch_up — they react only when dispatched by the master.
+        """
         acc_id = account["id"]
+        is_master = account.get("is_master", False)
         session = StringSession(account["session_str"])
         client = TelegramClient(
             session,
             int(account["api_id"]),
             account["api_hash"],
-            receive_updates=True,
+            receive_updates=is_master,  # only master needs updates
         )
 
         await asyncio.wait_for(client.connect(), timeout=_RPC_TIMEOUT)
@@ -242,43 +316,44 @@ class Reactor:
             await client.disconnect()
             return
 
-        # Register the new-message event handler.
-        self._register_event_handler(acc_id, client)
+        # Master-specific setup.
+        if is_master:
+            self.master_id = acc_id
+            self._register_event_handler(acc_id, client)
 
-        # ── CRITICAL: kick-start the update receiver ─────────────
-        # Without catch_up() Telethon connects but never processes
-        # incoming updates, so events.NewMessage never fires.
-        try:
-            await asyncio.wait_for(client.catch_up(), timeout=_RPC_TIMEOUT)
-            log.info(
-                "Account %s (%s): catch_up complete – update receiver active.",
+            try:
+                await asyncio.wait_for(client.catch_up(), timeout=_RPC_TIMEOUT)
+                log.info(
+                    "Master %s (%s): catch_up complete – update receiver active.",
+                    account["name"],
+                    acc_id,
+                )
+            except Exception as e:
+                log.warning(
+                    "Master %s (%s): catch_up raised %s – continuing anyway.",
+                    account["name"],
+                    acc_id,
+                    e,
+                )
+        else:
+            log.debug(
+                "Worker %s (%s): connected (no event handler).",
                 account["name"],
                 acc_id,
-            )
-        except Exception as e:
-            # catch_up can fail on fresh sessions – not fatal, the
-            # update loop may still work for *new* messages.
-            log.warning(
-                "Account %s (%s): catch_up raised %s – continuing anyway.",
-                account["name"],
-                acc_id,
-                e,
             )
 
         self.clients[acc_id] = client
         self.db.update_account_status(acc_id, "active")
-        log.info("Connected account %s (%s) – event listener registered.", account["name"], acc_id)
+        role_label = "MASTER" if is_master else "worker"
+        log.info("Connected account %s (%s) as %s.", account["name"], acc_id, role_label)
 
     def _register_event_handler(self, acc_id: str, client: TelegramClient) -> None:
         """Register (or re-register) the NewMessage handler on *client*.
 
-        We store one handler per account so we can cleanly remove it
-        later.  The handler is a catch-all — channel filtering happens
-        at runtime inside ``_maybe_dispatch_sweep`` so that adding or
-        removing target channels takes effect immediately without having
-        to touch event registrations.
+        Only the master account should have this handler.  The handler
+        is a catch-all — channel filtering happens at runtime inside
+        ``_maybe_dispatch_sweep``.
         """
-        # Remove the old handler for this account if it exists.
         old = self._handlers.pop(acc_id, None)
         if old is not None:
             try:
@@ -286,22 +361,26 @@ class Reactor:
             except Exception:
                 pass
 
-        # Build a per-account handler that carries the acc_id.
         async def _handler(event: events.NewMessage.Event) -> None:
             try:
                 await self._maybe_dispatch_sweep(event)
             except Exception:
                 log.exception(
-                    "Unhandled error in NewMessage handler (account %s)",
+                    "Unhandled error in NewMessage handler (master %s)",
                     acc_id[:8],
                 )
 
         client.add_event_handler(_handler, events.NewMessage())
         self._handlers[acc_id] = _handler
-        log.debug("Event handler registered for account %s", acc_id[:8])
+        log.debug("Event handler registered for master %s", acc_id[:8])
 
     async def remove_client(self, account_id: str) -> None:
         """Disconnect and forget a client."""
+        # If removing the master, clear the reference.
+        if account_id == self.master_id:
+            self.master_id = None
+            log.warning("Master account %s removed — no master active.", account_id[:8])
+
         client = self.clients.pop(account_id, None)
         # Remove handler reference.
         self._handlers.pop(account_id, None)
@@ -315,43 +394,157 @@ class Reactor:
             del self._peer_cache[k]
 
     # ================================================================ #
-    #  Keepalive loop – ensures event receivers stay alive              #
+    #  Master poll loop — fallback that catches missed events          #
     # ================================================================ #
 
-    async def _client_keepalive_loop(self) -> None:
-        """Periodically verify every client is still connected and its
-        update-receive task hasn't silently died.  If a client dropped,
-        reconnect it in-place so the NewMessage handler keeps firing."""
+    def _start_poll_loop(self) -> None:
+        """(Re)start the master fallback poll task."""
+        if self._poll_task is not None:
+            self._poll_task.cancel()
+        self._poll_task = asyncio.create_task(self._master_poll_loop())
+
+    async def _master_poll_loop(self) -> None:
+        """Every ``_POLL_INTERVAL`` seconds, use the master client to
+        fetch the latest messages from each target channel and dispatch
+        sweeps for any that haven't been processed yet.
+
+        This is a safety net in case the event handler misses something.
+        """
         try:
             while True:
-                await asyncio.sleep(_KEEPALIVE_INTERVAL)
-                for acc_id, client in list(self.clients.items()):
+                await asyncio.sleep(_POLL_INTERVAL)
+
+                mc = self.master_client
+                if mc is None or not mc.is_connected():
+                    log.debug("Poll loop: master not available, skipping cycle.")
+                    continue
+
+                if not self.target_channels:
+                    continue
+
+                for chat_id in list(self.target_channels):
                     try:
-                        if not client.is_connected():
-                            log.warning(
-                                "Keepalive: client %s disconnected – reconnecting.",
-                                acc_id[:8],
+                        messages = await asyncio.wait_for(
+                            mc.get_messages(chat_id, limit=3),
+                            timeout=_RPC_TIMEOUT,
+                        )
+                        for m in messages:
+                            if m is None:
+                                continue
+                            key = (chat_id, m.id)
+                            async with self._dedup_lock:
+                                if key in self._processed:
+                                    continue
+                                self._processed[key] = None
+                                while len(self._processed) > _MAX_PROCESSED:
+                                    self._processed.popitem(last=False)
+
+                            if not self.allowed_emojis:
+                                continue
+
+                            log.info(
+                                "Poll: new post detected %s/%s – dispatching sweep",
+                                chat_id,
+                                m.id,
                             )
-                            acc = self.db.get_account(acc_id)
-                            await self.remove_client(acc_id)
-                            if acc and acc["status"] == "active":
-                                await self._safe_add_client(acc)
+                            task = asyncio.create_task(
+                                self._sweep_reactions(chat_id, m.id)
+                            )
+                            self._bg_tasks.add(task)
+                            task.add_done_callback(self._bg_tasks.discard)
+
                     except asyncio.CancelledError:
                         raise
+                    except _AUTH_FATAL_ERRORS as e:
+                        log.warning(
+                            "Poll: master session dead: %s", e
+                        )
+                        # Don't remove here — keepalive will handle it.
+                        break
                     except Exception:
-                        log.exception("Keepalive: error for %s", acc_id[:8])
+                        log.debug(
+                            "Poll: error fetching messages for %s",
+                            chat_id,
+                            exc_info=True,
+                        )
+
         except asyncio.CancelledError:
-            log.debug("Keepalive loop cancelled.")
+            log.debug("Master poll loop cancelled.")
             raise
+
+    # ================================================================ #
+    #  Auto-join — master joins a channel automatically                #
+    # ================================================================ #
+
+    async def auto_join_channel(self, channel_entity: int | str) -> None:
+        """Make the master account (or any available client) join a
+        channel so it can monitor it for new posts.
+
+        *channel_entity* can be a numeric channel ID, a username, or
+        a ``t.me/+HASH`` / ``t.me/joinchat/HASH`` private invite link.
+        """
+        client = self.master_client
+        if client is None or not client.is_connected():
+            client = self._get_any_client()
+        if client is None:
+            log.warning("auto_join_channel: no client available to join %s", channel_entity)
+            return
+
+        entity_str = str(channel_entity)
+
+        # Check if it's a private invite link.
+        invite_match = _INVITE_HASH_RE.match(entity_str)
+        if invite_match:
+            invite_hash = invite_match.group(1)
+            try:
+                await asyncio.wait_for(
+                    client(ImportChatInviteRequest(hash=invite_hash)),
+                    timeout=_RPC_TIMEOUT,
+                )
+                log.info("Auto-joined private channel via invite hash: %s", invite_hash[:8])
+            except Exception as e:
+                log.warning(
+                    "auto_join_channel: ImportChatInviteRequest failed for hash %s: %s",
+                    invite_hash[:8],
+                    e,
+                )
+            return
+
+        # Public channel — resolve entity and join.
+        try:
+            entity = await asyncio.wait_for(
+                client.get_entity(channel_entity),
+                timeout=_RPC_TIMEOUT,
+            )
+            await asyncio.wait_for(
+                client(JoinChannelRequest(channel=entity)),
+                timeout=_RPC_TIMEOUT,
+            )
+            title = getattr(entity, "title", None) or str(channel_entity)
+            log.info("Auto-joined channel: %s", title)
+        except Exception as e:
+            # Not fatal — the account may already be a member, or it's
+            # a private channel that requires an invite link.
+            log.warning(
+                "auto_join_channel: JoinChannelRequest failed for %s: %s",
+                channel_entity,
+                e,
+            )
 
     # ================================================================ #
     #  Reload helpers                                                  #
     # ================================================================ #
 
     async def reload_channels(self) -> None:
+        old_channels = set(self.target_channels)
         rows = self.db.get_channels()
         self.target_channels = {int(r["channel_id"]) for r in rows}
         log.info("Channels reloaded: %d targets", len(self.target_channels))
+
+        # Auto-join any newly added channels.
+        new_channels = self.target_channels - old_channels
+        for ch_id in new_channels:
+            await self.auto_join_channel(ch_id)
 
     async def reload_emojis(self) -> None:
         rows = self.db.get_emojis()
@@ -372,6 +565,128 @@ class Reactor:
                 *(self._safe_add_client(acc) for acc in to_add),
                 return_exceptions=True,
             )
+
+    async def reload_master(self) -> None:
+        """Hot-swap the master account at runtime.
+
+        Called from the bot UI when the user promotes a different
+        account to master.
+        """
+        master_row = self.db.get_master_account()
+
+        old_master_id = self.master_id
+
+        if master_row is None:
+            # No master set — remove handler from old master if any.
+            if old_master_id and old_master_id in self.clients:
+                old_handler = self._handlers.pop(old_master_id, None)
+                if old_handler:
+                    try:
+                        self.clients[old_master_id].remove_event_handler(
+                            old_handler, events.NewMessage
+                        )
+                    except Exception:
+                        pass
+            self.master_id = None
+            log.warning("reload_master: no master configured.")
+            self._start_poll_loop()
+            return
+
+        new_master_id = master_row["id"]
+
+        # Remove event handler from old master if it changed.
+        if old_master_id and old_master_id != new_master_id:
+            old_handler = self._handlers.pop(old_master_id, None)
+            if old_handler and old_master_id in self.clients:
+                try:
+                    self.clients[old_master_id].remove_event_handler(
+                        old_handler, events.NewMessage
+                    )
+                except Exception:
+                    pass
+                log.info(
+                    "Removed event handler from old master %s",
+                    old_master_id[:8],
+                )
+
+        self.master_id = new_master_id
+
+        # Register handler on new master if it's connected.
+        if new_master_id in self.clients:
+            client = self.clients[new_master_id]
+            self._register_event_handler(new_master_id, client)
+            try:
+                await asyncio.wait_for(client.catch_up(), timeout=_RPC_TIMEOUT)
+            except Exception as e:
+                log.warning("reload_master: catch_up raised %s", e)
+            log.info("Master switched to %s", new_master_id[:8])
+        else:
+            # Master account isn't connected yet — connect it.
+            acc = self.db.get_account(new_master_id)
+            if acc:
+                await self._safe_add_client(acc)
+                log.info("Connected new master %s during reload", new_master_id[:8])
+
+        # Restart the poll loop with the new master.
+        self._start_poll_loop()
+
+        # Auto-join all target channels with the new master.
+        for ch_id in list(self.target_channels):
+            await self.auto_join_channel(ch_id)
+
+    # ================================================================ #
+    #  Keepalive loop — ensures clients stay alive                     #
+    # ================================================================ #
+
+    async def _client_keepalive_loop(self) -> None:
+        """Periodically verify every client is still connected.
+
+        Prioritises the master account — if the master dropped, it is
+        reconnected first.
+        """
+        try:
+            while True:
+                await asyncio.sleep(_KEEPALIVE_INTERVAL)
+
+                # Prioritise master reconnection.
+                if self.master_id and self.master_id in self.clients:
+                    mc = self.clients[self.master_id]
+                    try:
+                        if not mc.is_connected():
+                            log.warning(
+                                "Keepalive: MASTER %s disconnected – reconnecting.",
+                                self.master_id[:8],
+                            )
+                            acc = self.db.get_account(self.master_id)
+                            await self.remove_client(self.master_id)
+                            if acc and acc["status"] == "active":
+                                await self._safe_add_client(acc)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        log.exception("Keepalive: error for master %s", self.master_id[:8])
+
+                # Check workers.
+                for acc_id, client in list(self.clients.items()):
+                    if acc_id == self.master_id:
+                        continue  # already handled above
+                    try:
+                        if not client.is_connected():
+                            log.warning(
+                                "Keepalive: worker %s disconnected – reconnecting.",
+                                acc_id[:8],
+                            )
+                            acc = self.db.get_account(acc_id)
+                            await self.remove_client(acc_id)
+                            if acc and acc["status"] == "active":
+                                await self._safe_add_client(acc)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        log.exception("Keepalive: error for %s", acc_id[:8])
+        except asyncio.CancelledError:
+            log.debug("Keepalive loop cancelled.")
+            raise
 
     # ================================================================ #
     #  Health monitor                                                  #
@@ -401,12 +716,10 @@ class Reactor:
 
         log.info("Health check – probing %d connected clients …", len(self.clients))
 
-        # 1. Probe every connected client.
         for acc_id, client in list(self.clients.items()):
             try:
                 if not client.is_connected():
                     raise ConnectionError("Client disconnected")
-                # Lightweight RPC – validates session & connection.
                 await asyncio.wait_for(client.get_me(), timeout=_RPC_TIMEOUT)
             except _AUTH_FATAL_ERRORS as e:
                 log.warning("Session revoked/banned for %s: %s", acc_id[:8], e)
@@ -417,7 +730,6 @@ class Reactor:
                 raise
             except Exception as e:
                 log.warning("Health probe failed for %s: %s", acc_id[:8], e)
-                # Attempt an in-place reconnect before declaring failure.
                 acc = self.db.get_account(acc_id)
                 await self.remove_client(acc_id)
                 if acc:
@@ -430,7 +742,7 @@ class Reactor:
                 self.db.update_account_status(acc_id, "failed")
                 await self._send_health_alert(acc_id, str(e))
 
-        # 2. Try to bring up accounts that are 'active' in DB but not running.
+        # Try to bring up accounts that are 'active' in DB but not running.
         for acc in self.db.get_active_accounts():
             if acc["id"] not in self.clients:
                 try:
@@ -497,7 +809,6 @@ class Reactor:
             ChannelPrivateError, ChatWriteForbiddenError, PeerIdInvalidError
                 — caller must handle (retrying emojis won't help).
         """
-        # Shuffle so we don't always hammer the same emoji first.
         candidates = list(emojis)
         random.shuffle(candidates)
 
@@ -516,11 +827,9 @@ class Reactor:
                     timeout=_RPC_TIMEOUT,
                 )
                 log.debug("  %s reacted with %s", acc_label, emoji)
-                return emoji  # ✅ success — stop trying
+                return emoji
 
             except _EMOJI_RETRY_ERRORS as e:
-                # This emoji is not valid for this channel / message.
-                # Try the next one.
                 log.debug(
                     "  %s: emoji %s rejected (%s) – trying next",
                     acc_label,
@@ -539,7 +848,6 @@ class Reactor:
 
             # All other errors propagate to caller (FloodWait, AuthKey, etc.).
 
-        # All emojis exhausted.
         log.warning(
             "  %s: all %d emojis failed. Last error: %s",
             acc_label,
@@ -596,7 +904,7 @@ class Reactor:
             )
 
             for acc_id, client in list(self.clients.items()):
-                # ── Cooldown check ───────────────────────────────
+                # Cooldown check.
                 cooldown_until = self._cooldowns.get(acc_id, 0)
                 now = time.monotonic()
                 if now < cooldown_until:
@@ -637,7 +945,7 @@ class Reactor:
                     self.db.update_account_status(acc_id, "failed")
                     await self.remove_client(acc_id)
                     await self._send_health_alert(acc_id, str(e))
-                    continue  # skip the 1-s delay for a removed client
+                    continue
 
                 except (
                     ChannelPrivateError,
@@ -751,7 +1059,6 @@ class Reactor:
         errors: list[str] = []
 
         for acc_id, client in list(self.clients.items()):
-            # Respect per-account flood cooldowns.
             cooldown_until = self._cooldowns.get(acc_id, 0)
             now = time.monotonic()
             if now < cooldown_until:
@@ -762,7 +1069,6 @@ class Reactor:
                 await asyncio.sleep(wait)
 
             try:
-                # Resolve the entity for this specific account.
                 if raw_id:
                     chat_id: int | str = int(f"-100{raw_id}")
                     peer = await asyncio.wait_for(
@@ -802,7 +1108,7 @@ class Reactor:
                 await self._send_health_alert(acc_id, str(e))
                 failed += 1
                 errors.append("Session revoked")
-                continue  # skip delay
+                continue
 
             except (
                 ChannelPrivateError,
@@ -830,7 +1136,6 @@ class Reactor:
         lines = ["⚡ *Instant Reaction Complete*\n"]
         lines.append(f"✅ Success: {success}  |  ❌ Failed: {failed}")
         if errors:
-            # Show unique errors, max 5.
             unique = list(dict.fromkeys(errors))[:5]
             lines.append("\n*Errors:*")
             for err in unique:
@@ -842,7 +1147,15 @@ class Reactor:
     # ================================================================ #
 
     def _get_any_client(self) -> TelegramClient | None:
-        """Return the first available connected client, or None."""
+        """Return the first available connected client.
+
+        Prefers the master client if available.
+        """
+        # Prefer master.
+        mc = self.master_client
+        if mc is not None and mc.is_connected():
+            return mc
+        # Fall back to any connected client.
         for client in self.clients.values():
             if client.is_connected():
                 return client
@@ -860,18 +1173,16 @@ class Reactor:
         if client is None:
             return "❌ No active accounts to resolve entity. Add an account first."
 
-        # Try to extract from link.
         username = link_or_username.strip()
         m = _CHANNEL_LINK_RE.match(username)
         if m:
             raw_id, uname = m.groups()
             if raw_id:
-                # Private-style link: t.me/c/123456/...
                 entity_ref: int | str = int(f"-100{raw_id}")
             else:
                 entity_ref = uname
         elif username.startswith("@"):
-            entity_ref = username[1:]  # strip @
+            entity_ref = username[1:]
         else:
             entity_ref = username
 
@@ -879,12 +1190,9 @@ class Reactor:
             entity = await asyncio.wait_for(
                 client.get_entity(entity_ref), timeout=_RPC_TIMEOUT
             )
-            # entity can be Channel, Chat, etc.
             title = getattr(entity, "title", None) or getattr(entity, "username", None) or str(entity_ref)
-            # Build the -100-prefixed ID for channels/supergroups.
             entity_id = entity.id
             if hasattr(entity, "broadcast") or hasattr(entity, "megagroup"):
-                # Channel or supergroup — need -100 prefix.
                 if entity_id > 0:
                     entity_id = int(f"-100{entity_id}")
             return (entity_id, title)

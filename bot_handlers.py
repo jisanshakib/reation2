@@ -1,21 +1,20 @@
-"""100 % Inline-Keyboard-driven Telegram bot UI  (v5).
+"""100 % Inline-Keyboard-driven Telegram bot UI  (v7).
 
-v5 changes
+v7 changes
 ──────────
-• ⚡ Instant Reaction: new main-menu button → user sends a post link →
-  ALL active accounts react to it immediately, no pre-registration required.
-• Channel addition now accepts t.me links and @usernames in addition to
-  raw numeric IDs. Telethon resolves the entity automatically.
-• Admin addition (both inline panel and /addadmin command) accepts
-  @usernames alongside numeric User IDs.
-• Top-level try/except in ``callback_handler`` and ``text_handler`` so
-  no unhandled exception can crash a callback or leave the UI hanging.
-• ``telegram.error.BadRequest: Message is not modified`` silently ignored
-  (user double-clicking the same button).
-• ``/addadmin <user_id_or_@username> [admin|moderator]`` command handler
-  (owner only).
-• Friendly "No items yet" messages when accounts/channels/emojis are empty.
-• All DB look-ups in callback_handler wrapped for safety.
+• 👑 Master Account UI: accounts list shows 👑 badge for the master
+  account.  Account detail view displays "👑 Master Account" or
+  "⚙️ Worker Account" badge.  "👑 Set as Master" button available
+  in account detail (owner / admin only, when not already master).
+• After adding a channel, ``reactor.auto_join_channel()`` is called
+  so the master account joins automatically.
+• Help text updated to explain the Master / Worker concept.
+
+Preserved from v5
+──────────────────
+• ⚡ Instant Reaction, channel link / @username resolution, admin
+  @username resolution, full registration wizard, emoji management,
+  admin panel, role management, /addadmin command.
 """
 
 from __future__ import annotations
@@ -121,7 +120,12 @@ def _main_menu_kb(user_id: int) -> InlineKeyboardMarkup:
 def _accounts_kb(accounts: list[dict], can_add: bool) -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = []
     for acc in accounts:
-        icon = "🟢" if acc["status"] == "active" else "🔴"
+        if acc.get("is_master"):
+            icon = "👑"
+        elif acc["status"] == "active":
+            icon = "🟢"
+        else:
+            icon = "🔴"
         rows.append(
             [InlineKeyboardButton(f"{icon} {acc['name']}", callback_data=f"acc:{acc['id']}")]
         )
@@ -131,7 +135,9 @@ def _accounts_kb(accounts: list[dict], can_add: bool) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
-def _account_detail_kb(acc_id: str, can_manage: bool) -> InlineKeyboardMarkup:
+def _account_detail_kb(
+    acc_id: str, can_manage: bool, is_master: bool = False
+) -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = []
     if can_manage:
         rows.append(
@@ -140,6 +146,10 @@ def _account_detail_kb(acc_id: str, can_manage: bool) -> InlineKeyboardMarkup:
                 InlineKeyboardButton("Delete 🗑️", callback_data=f"acc_del:{acc_id}"),
             ]
         )
+        if not is_master:
+            rows.append(
+                [InlineKeyboardButton("👑 Set as Master", callback_data=f"acc_master:{acc_id}")]
+            )
     rows.append([_back_button("accounts")])
     return InlineKeyboardMarkup(rows)
 
@@ -245,6 +255,13 @@ _HELP_TEXT = (
     "• *Admin* 🛡️ — manage accounts, channels, emojis.\n"
     "• *Moderator* 👁️ — add channels & emojis, view accounts (read-only).\n\n"
 
+    "*👑 Master / Worker Accounts*\n"
+    "• Set one account as *Master* via the account detail page.\n"
+    "• The Master account monitors target channels for new posts.\n"
+    "• When a new post is detected, ALL accounts (Master + Workers) react.\n"
+    "• Only one Master can be active at a time.\n"
+    "• The Master auto-joins new channels when they are added.\n\n"
+
     "*📱 Adding Accounts (StringSession)*\n"
     "1. Go to https://my.telegram.org → log in → create an app.\n"
     "2. Note your *API ID* and *API Hash*.\n"
@@ -263,7 +280,7 @@ _HELP_TEXT = (
     "   • `@mychannel`\n"
     "   • `-1001234567890 My Channel`\n"
     "3. The bot resolves the entity automatically.\n"
-    "4. Make sure every registered account has *joined* the channel.\n\n"
+    "4. The Master account auto-joins the channel.\n\n"
 
     "*⚡ Instant Reaction*\n"
     "• Tap *⚡ Instant Reaction* in the main menu.\n"
@@ -396,8 +413,6 @@ async def callback_handler(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> N
     try:
         await _route_callback(query, user_id, role, data)
     except BadRequest as e:
-        # "Message is not modified" happens when user double-clicks a
-        # button that leads to the same content — harmless, ignore.
         if "Message is not modified" in str(e):
             log.debug("Ignored: Message is not modified (user_id=%d)", user_id)
         else:
@@ -424,7 +439,7 @@ async def _route_callback(query: Any, user_id: int, role: str | None, data: str)
     """Inner dispatch – separated so the caller can catch exceptions."""
 
     # Keep state during active input flows.
-    keep = ("acc_add", "skip_phone", "ch_add", "em_add", "adm_add",
+    keep = ("acc_add", "acc_master", "skip_phone", "ch_add", "em_add", "adm_add",
             "set_role", "cancel", "instant_react")
     if not data.startswith(keep):
         user_states.pop(user_id, None)
@@ -465,7 +480,6 @@ async def _route_callback(query: Any, user_id: int, role: str | None, data: str)
     # ─── Accounts ──────────────────────────────────────────────── #
     elif data == "accounts":
         can_manage = _can_manage_accounts(user_id)
-        # Owner sees ALL accounts; Admin sees own; Moderator sees all (read-only).
         if role == "owner":
             accs = db.get_all_accounts()
             title = "📱 *All Accounts*"
@@ -511,23 +525,25 @@ async def _route_callback(query: Any, user_id: int, role: str | None, data: str)
             return
 
         can_manage = _can_manage_accounts(user_id)
-        # Ownership check: owner can view any; admin own only; moderator any (view).
         if role == "admin" and acc["owner_id"] != user_id:
             await query.answer("⛔ Not your account", show_alert=True)
             return
 
         icon = "🟢 Active" if acc["status"] == "active" else "🔴 Failed"
+        is_master = acc.get("is_master", False)
+        badge = "👑 Master Account" if is_master else "⚙️ Worker Account"
         text = (
             f"📱 *Account Detail*\n\n"
             f"• *Name:* {acc['name']}\n"
             f"• *Phone:* {acc.get('phone') or 'N/A'}\n"
             f"• *API ID:* `{acc['api_id']}`\n"
             f"• *API Hash:* `{acc['api_hash'][:8]}…`\n"
-            f"• *Status:* {icon}"
+            f"• *Status:* {icon}\n"
+            f"• *Role:* {badge}"
         )
         await query.edit_message_text(
             text,
-            reply_markup=_account_detail_kb(acc_id, can_manage=can_manage),
+            reply_markup=_account_detail_kb(acc_id, can_manage=can_manage, is_master=is_master),
             parse_mode="Markdown",
         )
 
@@ -552,7 +568,6 @@ async def _route_callback(query: Any, user_id: int, role: str | None, data: str)
             return
         acc_id = data.split(":", 1)[1]
         acc = db.get_account(acc_id)
-        # Admin can only delete own; owner can delete any.
         if acc and role == "admin" and acc["owner_id"] != user_id:
             await query.answer("⛔ Not your account", show_alert=True)
             return
@@ -578,6 +593,38 @@ async def _route_callback(query: Any, user_id: int, role: str | None, data: str)
             "✅ Account deleted.",
             reply_markup=InlineKeyboardMarkup([[_back_button("accounts")]]),
         )
+
+    # ─── Set Master ────────────────────────────────────────────── #
+    elif data.startswith("acc_master:"):
+        if not _can_manage_accounts(user_id):
+            await query.answer("⛔ Admins and Owner only", show_alert=True)
+            return
+        acc_id = data.split(":", 1)[1]
+        acc = db.get_account(acc_id)
+        if acc is None:
+            await query.edit_message_text(
+                "Account not found.",
+                reply_markup=InlineKeyboardMarkup([[_back_button("accounts")]]),
+            )
+            return
+        name = acc["name"]
+        try:
+            db.set_master_account(acc_id)
+            await reactor.reload_master()
+            await query.edit_message_text(
+                f"👑 *{name}* is now the Master Account!\n\n"
+                "It will monitor all target channels and dispatch "
+                "reactions to all accounts when new posts are detected.",
+                reply_markup=InlineKeyboardMarkup([[_back_button("accounts")]]),
+                parse_mode="Markdown",
+            )
+        except Exception as e:
+            log.exception("Failed to set master account")
+            await query.edit_message_text(
+                f"❌ Failed to set master: `{e}`",
+                reply_markup=InlineKeyboardMarkup([[_back_button("accounts")]]),
+                parse_mode="Markdown",
+            )
 
     # ─── Skip phone ────────────────────────────────────────────── #
     elif data == "skip_phone":
@@ -963,7 +1010,6 @@ async def _route_text(msg: Any, user_id: int, state: dict) -> None:  # noqa: C90
     elif step == "instant_react":
         user_states.pop(user_id, None)
         post_link = text.strip()
-        # Send a "working…" message since this can take a while.
         progress = await msg.reply_text(
             "⚡ *Triggering reactions across all accounts…*\n"
             "Please wait ⏳",
@@ -977,7 +1023,6 @@ async def _route_text(msg: Any, user_id: int, state: dict) -> None:  # noqa: C90
                 parse_mode="Markdown",
             )
         except Exception:
-            # If edit fails, send a new message.
             await msg.reply_text(
                 result,
                 reply_markup=InlineKeyboardMarkup([[_back_button()]]),
@@ -989,9 +1034,7 @@ async def _route_text(msg: Any, user_id: int, state: dict) -> None:  # noqa: C90
         user_states.pop(user_id, None)
         raw = text.strip()
 
-        # Detect if user sent a link or @username.
         if raw.startswith("https://t.me/") or raw.startswith("http://t.me/") or raw.startswith("@"):
-            # Resolve via Telethon.
             progress = await msg.reply_text(
                 "🔄 Resolving channel…",
                 reply_markup=InlineKeyboardMarkup(
@@ -1000,7 +1043,6 @@ async def _route_text(msg: Any, user_id: int, state: dict) -> None:  # noqa: C90
             )
             result = await reactor.resolve_channel_entity(raw)
             if isinstance(result, str):
-                # Error string.
                 try:
                     await progress.edit_text(
                         result,
@@ -1019,6 +1061,8 @@ async def _route_text(msg: Any, user_id: int, state: dict) -> None:  # noqa: C90
             try:
                 db.add_channel(channel_id, channel_name, user_id)
                 await reactor.reload_channels()
+                # Master auto-joins the new channel.
+                await reactor.auto_join_channel(channel_id)
                 try:
                     await progress.edit_text(
                         f"✅ Channel *{channel_name}* (`{channel_id}`) added!",
@@ -1047,7 +1091,6 @@ async def _route_text(msg: Any, user_id: int, state: dict) -> None:  # noqa: C90
                     )
 
         else:
-            # Legacy format: numeric ID + name.
             parts = raw.split(maxsplit=1)
             if len(parts) < 2:
                 await msg.reply_text(
@@ -1072,6 +1115,8 @@ async def _route_text(msg: Any, user_id: int, state: dict) -> None:  # noqa: C90
             try:
                 db.add_channel(channel_id, channel_name, user_id)
                 await reactor.reload_channels()
+                # Master auto-joins the new channel.
+                await reactor.auto_join_channel(channel_id)
                 await msg.reply_text(
                     f"✅ Channel *{channel_name}* added!",
                     reply_markup=InlineKeyboardMarkup([[_back_button("channels")]]),
@@ -1117,7 +1162,6 @@ async def _route_text(msg: Any, user_id: int, state: dict) -> None:  # noqa: C90
             return
         raw = text.strip()
 
-        # Support @username resolution.
         if raw.startswith("@"):
             progress = await msg.reply_text(
                 f"🔄 Resolving `{raw}`…", parse_mode="Markdown"
