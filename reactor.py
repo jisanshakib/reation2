@@ -857,27 +857,13 @@ class Reactor:
             return False
 
     async def _send_rebind_success_alert(self, acc: dict) -> None:
-        """Notify the admin that an account was auto-recovered."""
-        if self._bot is None:
-            return
+        """Log that an account was auto-recovered (silent — no DM).
 
-        from config import PERMANENT_OWNER_ID
-
-        text = (
-            "🔄 *Auto-Rebind Success*\n\n"
-            f"• *Account:* {acc['name']}\n"
-            f"• *Issue:* Session expired / disconnected\n"
-            f"• *Status:* Successfully recovered and "
-            f"reactivated automatically!"
+        The admin can review recovery events from the /stats dashboard.
+        """
+        log.info(
+            "Auto-rebind success for %s — recovered silently.", acc["name"]
         )
-        try:
-            await self._bot.send_message(
-                chat_id=PERMANENT_OWNER_ID,
-                text=text,
-                parse_mode="Markdown",
-            )
-        except Exception:
-            log.debug("Failed to send rebind success alert for %s", acc["name"])
 
     # ================================================================ #
     #  Aggressive Instant Self-Revive                                   #
@@ -922,33 +908,21 @@ class Reactor:
                 acc_id,
                 f"Instant Self-Revive FAILED for reason: {reason}. "
                 f"Manual OTP/2FA re-authentication required.",
+                critical=True,
             )
 
     async def _send_instant_revive_alert(self, acc_id: str, reason: str) -> None:
-        """Notify the admin about a successful instant self-revive."""
-        if self._bot is None:
-            return
+        """Log that an instant self-revive succeeded (silent — no DM).
 
-        from config import PERMANENT_OWNER_ID
-
+        The admin can review revive events from the /stats dashboard.
+        """
         acc = self.db.get_account(acc_id)
         name = acc["name"] if acc else acc_id[:8]
-
-        text = (
-            "🚨 *Instant Self-Revive Triggered & Successful!*\n\n"
-            f"• *Account:* {name}\n"
-            f"• *Reason:* {reason}\n"
-            f"• *Status:* Automatically revived and back "
-            f"online instantly!"
+        log.info(
+            "Instant Self-Revive success for %s (reason: %s) — recovered silently.",
+            name,
+            reason,
         )
-        try:
-            await self._bot.send_message(
-                chat_id=PERMANENT_OWNER_ID,
-                text=text,
-                parse_mode="Markdown",
-            )
-        except Exception:
-            log.debug("Failed to send instant-revive alert for %s", name)
 
     # ================================================================ #
     #  Bulk rebind – attempt reconnect for all / failed accounts       #
@@ -1231,7 +1205,7 @@ class Reactor:
                 if await self._try_auto_rebind(acc_id):
                     continue
                 self.db.update_account_status(acc_id, "failed")
-                await self._send_health_alert(acc_id, str(e))
+                await self._send_health_alert(acc_id, str(e), critical=True)
             except asyncio.CancelledError:
                 raise
             except Exception as e:
@@ -1250,7 +1224,7 @@ class Reactor:
                     except Exception:
                         pass
                 self.db.update_account_status(acc_id, "failed")
-                await self._send_health_alert(acc_id, str(e))
+                await self._send_health_alert(acc_id, str(e), critical=True)
 
         # Try to bring up accounts that are 'active' in DB but not running.
         for acc in self.db.get_active_accounts():
@@ -1262,24 +1236,38 @@ class Reactor:
                     # Try auto-rebind before marking failed.
                     if not await self._try_auto_rebind(acc["id"]):
                         self.db.update_account_status(acc["id"], "failed")
-                        await self._send_health_alert(acc["id"], str(e))
+                        await self._send_health_alert(acc["id"], str(e), critical=True)
                 except Exception as e:
                     log.warning("Recovery failed for %s: %s", acc["name"], e)
                     if not await self._try_auto_rebind(acc["id"]):
                         self.db.update_account_status(acc["id"], "failed")
-                        await self._send_health_alert(acc["id"], str(e))
+                        await self._send_health_alert(acc["id"], str(e), critical=True)
 
-    async def _send_health_alert(self, account_id: str, error: str) -> None:
-        """Send a private DM to the Permanent Owner about a failed account."""
+    async def _send_health_alert(
+        self, account_id: str, error: str, *, critical: bool = False,
+    ) -> None:
+        """Record a health event for *account_id*.
+
+        When *critical* is ``True`` the admin receives a Telegram DM
+        (e.g. session permanently dead, manual OTP required).  Otherwise
+        the event is only logged — the admin can review it later from
+        the analytics dashboard.
+        """
+        acc = self.db.get_account(account_id)
+        name = acc["name"] if acc else account_id[:8]
+        phone = (acc.get("phone") or "N/A") if acc else "N/A"
+
+        # Always write to the application log.
+        log.warning("Health alert [%s] %s: %s", name, error, "CRITICAL" if critical else "silent")
+
+        if not critical:
+            return  # silent — admin checks via /stats dashboard
+
         if self._bot is None:
             log.warning("Cannot send health alert – bot reference not set.")
             return
 
         from config import PERMANENT_OWNER_ID
-
-        acc = self.db.get_account(account_id)
-        name = acc["name"] if acc else account_id[:8]
-        phone = (acc.get("phone") or "N/A") if acc else "N/A"
 
         text = (
             "🔴 *Account Health Alert*\n\n"
@@ -1756,13 +1744,39 @@ class Reactor:
     async def _resolve_peer(
         self, acc_id: str, client: TelegramClient, chat_id: int | str
     ) -> object:
+        """Resolve the InputPeer for *chat_id* with automatic entity
+        priming for worker accounts.
+
+        Workers may not have the channel in their local session cache
+        (unlike the master, which runs ``get_dialogs``).  When the fast
+        ``get_input_entity`` fails with ``ValueError``, we fall back to
+        a full ``get_entity`` (API call) which populates the cache for
+        subsequent calls.
+        """
         key = (acc_id, chat_id if isinstance(chat_id, int) else hash(chat_id))
         peer = self._peer_cache.get(key)
         if peer is not None:
             return peer
-        peer = await asyncio.wait_for(
-            client.get_input_entity(chat_id), timeout=_RPC_TIMEOUT
-        )
+
+        try:
+            peer = await asyncio.wait_for(
+                client.get_input_entity(chat_id), timeout=_RPC_TIMEOUT
+            )
+        except (ValueError, KeyError):
+            # Entity not in local session cache — prime it via full
+            # get_entity API call, then extract the InputPeer.
+            log.debug(
+                "Peer cache miss for %s / %s — priming via get_entity",
+                acc_id[:8],
+                chat_id,
+            )
+            entity = await asyncio.wait_for(
+                client.get_entity(chat_id), timeout=_RPC_TIMEOUT
+            )
+            peer = await asyncio.wait_for(
+                client.get_input_entity(entity), timeout=_RPC_TIMEOUT
+            )
+
         self._peer_cache[key] = peer
         return peer
 
