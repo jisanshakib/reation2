@@ -24,18 +24,24 @@ CREATE UNIQUE INDEX IF NOT EXISTS accounts_single_master
 
 -- 2. Channels Table (With unique channel_id for upsert support)
 CREATE TABLE IF NOT EXISTS channels (
-    id            UUID DEFAULT gen_random_uuid() PRIMARY KEY,
-    channel_id    BIGINT       NOT NULL UNIQUE,
-    channel_name  TEXT         NOT NULL,
-    username      TEXT,
-    invite_link   TEXT,
-    added_by      BIGINT       NOT NULL,
-    created_at    TIMESTAMPTZ  NOT NULL DEFAULT now()
+    id                  UUID DEFAULT gen_random_uuid() PRIMARY KEY,
+    channel_id          BIGINT       NOT NULL UNIQUE,
+    channel_name        TEXT         NOT NULL,
+    username            TEXT,
+    invite_link         TEXT,
+    view_setting        TEXT         NOT NULL DEFAULT 'random',
+    reaction_setting    TEXT         NOT NULL DEFAULT '40',
+    custom_reaction_val INTEGER,
+    added_by            BIGINT       NOT NULL,
+    created_at          TIMESTAMPTZ  NOT NULL DEFAULT now()
 );
 
 -- Idempotent migrations for existing installations:
 ALTER TABLE channels ADD COLUMN IF NOT EXISTS username TEXT;
 ALTER TABLE channels ADD COLUMN IF NOT EXISTS invite_link TEXT;
+ALTER TABLE channels ADD COLUMN IF NOT EXISTS view_setting TEXT DEFAULT 'random';
+ALTER TABLE channels ADD COLUMN IF NOT EXISTS reaction_setting TEXT DEFAULT '40';
+ALTER TABLE channels ADD COLUMN IF NOT EXISTS custom_reaction_val INTEGER;
 
 -- 3. Emojis Table
 CREATE TABLE IF NOT EXISTS emojis (

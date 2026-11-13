@@ -217,8 +217,67 @@ def _channels_kb(channels: list[dict]) -> InlineKeyboardMarkup:
 def _channel_detail_kb(ch_id: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
+            [InlineKeyboardButton("🎛️ Control View & Reaction", callback_data=f"ch_ctrl:{ch_id}")],
             [InlineKeyboardButton("🗑️ Remove Channel", callback_data=f"ch_del:{ch_id}")],
             [_back_button("channels")],
+        ]
+    )
+
+
+def _channel_ctrl_kb(ch_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("👁️ Control View Menu", callback_data=f"ch_vmenu:{ch_id}")],
+            [InlineKeyboardButton("⚡ Control Reaction Menu", callback_data=f"ch_rmenu:{ch_id}")],
+            [_back_button(f"ch:{ch_id}")],
+        ]
+    )
+
+
+def _channel_view_menu_kb(ch_id: str, current_setting: str) -> InlineKeyboardMarkup:
+    cur = str(current_setting or "random").lower()
+    b70 = f"{'✅ ' if cur == '70' else ''}70% View"
+    b80 = f"{'✅ ' if cur == '80' else ''}80% View"
+    b90 = f"{'✅ ' if cur == '90' else ''}90% View"
+    brand = f"{'✅ ' if cur == 'random' else ''}🎲 Random View"
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(b70, callback_data=f"ch_vset:{ch_id}:70"),
+                InlineKeyboardButton(b80, callback_data=f"ch_vset:{ch_id}:80"),
+            ],
+            [
+                InlineKeyboardButton(b90, callback_data=f"ch_vset:{ch_id}:90"),
+                InlineKeyboardButton(brand, callback_data=f"ch_vset:{ch_id}:random"),
+            ],
+            [_back_button(f"ch_ctrl:{ch_id}")],
+        ]
+    )
+
+
+def _channel_reaction_menu_kb(ch_id: str, current_setting: str, custom_val: int | None = None) -> InlineKeyboardMarkup:
+    cur = str(current_setting or "40").lower()
+    b30 = f"{'✅ ' if cur == '30' else ''}30% Reaction"
+    b40 = f"{'✅ ' if cur == '40' else ''}40% Reaction"
+    b50 = f"{'✅ ' if cur == '50' else ''}50% Reaction"
+    if cur == "custom" and custom_val:
+        bcustom = f"✅ Custom Reaction ({custom_val}%)"
+    else:
+        bcustom = "✏️ Custom Reaction (1-100%)"
+
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(b30, callback_data=f"ch_rset:{ch_id}:30"),
+                InlineKeyboardButton(b40, callback_data=f"ch_rset:{ch_id}:40"),
+            ],
+            [
+                InlineKeyboardButton(b50, callback_data=f"ch_rset:{ch_id}:50"),
+            ],
+            [
+                InlineKeyboardButton(bcustom, callback_data=f"ch_rset:{ch_id}:custom"),
+            ],
+            [_back_button(f"ch_ctrl:{ch_id}")],
         ]
     )
 
@@ -532,11 +591,13 @@ async def cmd_addadmin(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
 async def callback_handler(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:  # noqa: C901
     query = update.callback_query
     assert query is not None
-    await query.answer()
 
     user_id = query.from_user.id
     if not _is_authorized(user_id):
-        await query.answer("⛔ Unauthorised", show_alert=True)
+        try:
+            await query.answer("⛔ Unauthorised", show_alert=True)
+        except Exception:
+            pass
         return
 
     data: str = query.data or ""
@@ -563,6 +624,15 @@ async def callback_handler(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> N
                 "❌ Something went wrong. Tap /start to return.",
                 reply_markup=InlineKeyboardMarkup([[_back_button()]]),
             )
+        except Exception:
+            pass
+    finally:
+        # Acknowledge callback query if it wasn't already answered to dismiss button spinner
+        try:
+            if hasattr(query, "answered") and not query.answered:
+                await query.answer()
+            elif not hasattr(query, "answered"):
+                await query.answer()
         except Exception:
             pass
 
@@ -1131,10 +1201,207 @@ async def _route_callback(query: Any, user_id: int, role: str | None, data: str)
                 reply_markup=InlineKeyboardMarkup([[_back_button("channels")]]),
             )
             return
-        text = f"📡 *Channel*\n\n• *Name:* {ch['channel_name']}\n• *ID:* `{ch['channel_id']}`"
+
+        v_setting = ch.get("view_setting") or "random"
+        r_setting = ch.get("reaction_setting") or "40"
+        c_val = ch.get("custom_reaction_val")
+
+        v_desc = "🎲 Random (70%/80%/90%)" if v_setting == "random" else f"{v_setting}%"
+        if r_setting == "custom":
+            r_desc = f"✏️ Custom ({c_val or 40}%)"
+        else:
+            r_desc = f"{r_setting}%"
+
+        uname_line = f"\n• *Username:* @{ch['username']}" if ch.get("username") else ""
+        link_line = f"\n• *Invite Link:* `{ch['invite_link'][:30]}…`" if ch.get("invite_link") else ""
+
+        text = (
+            f"📡 *Channel Detail*\n\n"
+            f"• *Name:* {ch['channel_name']}\n"
+            f"• *ID:* `{ch['channel_id']}`"
+            f"{uname_line}"
+            f"{link_line}\n"
+            f"• *Target Views:* `{v_desc}`\n"
+            f"• *Target Reactions:* `{r_desc}`"
+        )
         await query.edit_message_text(
             text, reply_markup=_channel_detail_kb(ch_id), parse_mode="Markdown"
         )
+
+    # ─── Control View & Reaction Main Menu ─────────────────────── #
+    elif data.startswith("ch_ctrl:"):
+        ch_id = data.split(":", 1)[1]
+        if not _can_manage_channels(user_id):
+            await query.answer("⛔ Not authorized", show_alert=True)
+            return
+        ch = db.get_channel(ch_id)
+        if not ch:
+            await query.edit_message_text(
+                "Channel not found.",
+                reply_markup=InlineKeyboardMarkup([[_back_button("channels")]]),
+            )
+            return
+
+        v_setting = ch.get("view_setting") or "random"
+        r_setting = ch.get("reaction_setting") or "40"
+        c_val = ch.get("custom_reaction_val")
+        v_desc = "🎲 Random (70%/80%/90%)" if v_setting == "random" else f"{v_setting}%"
+        r_desc = f"✏️ Custom ({c_val or 40}%)" if r_setting == "custom" else f"{r_setting}%"
+
+        text = (
+            f"🎛️ *Per-Channel View & Reaction Controls*\n\n"
+            f"Channel: *{ch['channel_name']}*\n"
+            f"Channel ID: `{ch['channel_id']}`\n\n"
+            f"👁️ *Current View Setting:* `{v_desc}`\n"
+            f"⚡ *Current Reaction Setting:* `{r_desc}`\n\n"
+            f"Select a setting below to customize:"
+        )
+        await query.edit_message_text(
+            text, reply_markup=_channel_ctrl_kb(ch_id), parse_mode="Markdown"
+        )
+
+    # ─── Control View Menu ─────────────────────────────────────── #
+    elif data.startswith("ch_vmenu:"):
+        ch_id = data.split(":", 1)[1]
+        if not _can_manage_channels(user_id):
+            await query.answer("⛔ Not authorized", show_alert=True)
+            return
+        ch = db.get_channel(ch_id)
+        if not ch:
+            await query.edit_message_text(
+                "Channel not found.",
+                reply_markup=InlineKeyboardMarkup([[_back_button("channels")]]),
+            )
+            return
+
+        v_setting = ch.get("view_setting") or "random"
+        v_desc = "🎲 Random (70%/80%/90%)" if v_setting == "random" else f"{v_setting}%"
+
+        text = (
+            f"👁️ *Control View Menu*\n\n"
+            f"Channel: *{ch['channel_name']}*\n"
+            f"Current Setting: *{v_desc}*\n\n"
+            f"Select target percentage of worker accounts that will view each new post in this channel:"
+        )
+        await query.edit_message_text(
+            text,
+            reply_markup=_channel_view_menu_kb(ch_id, v_setting),
+            parse_mode="Markdown",
+        )
+
+    # ─── Set View Setting ──────────────────────────────────────── #
+    elif data.startswith("ch_vset:"):
+        if not _can_manage_channels(user_id):
+            await query.answer("⛔ Not authorized", show_alert=True)
+            return
+        parts = data.split(":")
+        ch_id = parts[1]
+        val = parts[2]
+        ch = db.get_channel(ch_id)
+        if not ch:
+            await query.answer("Channel not found.", show_alert=True)
+            return
+
+        db.update_channel_view_setting(ch["channel_id"], val)
+        await reactor.reload_channels()
+
+        v_desc = "🎲 Random (70%/80%/90%)" if val == "random" else f"{val}%"
+        try:
+            await query.answer(f"✅ View target set to {v_desc} for {ch['channel_name']}!", show_alert=False)
+        except Exception:
+            pass
+
+        text = (
+            f"👁️ *Control View Menu*\n\n"
+            f"Channel: *{ch['channel_name']}*\n"
+            f"Current Setting: *{v_desc}*\n\n"
+            f"Select target percentage of worker accounts that will view each new post in this channel:"
+        )
+        await query.edit_message_text(
+            text,
+            reply_markup=_channel_view_menu_kb(ch_id, val),
+            parse_mode="Markdown",
+        )
+
+    # ─── Control Reaction Menu ─────────────────────────────────── #
+    elif data.startswith("ch_rmenu:"):
+        ch_id = data.split(":", 1)[1]
+        if not _can_manage_channels(user_id):
+            await query.answer("⛔ Not authorized", show_alert=True)
+            return
+        ch = db.get_channel(ch_id)
+        if not ch:
+            await query.edit_message_text(
+                "Channel not found.",
+                reply_markup=InlineKeyboardMarkup([[_back_button("channels")]]),
+            )
+            return
+
+        r_setting = ch.get("reaction_setting") or "40"
+        c_val = ch.get("custom_reaction_val")
+        r_desc = f"✏️ Custom ({c_val or 40}%)" if r_setting == "custom" else f"{r_setting}%"
+
+        text = (
+            f"⚡ *Control Reaction Menu*\n\n"
+            f"Channel: *{ch['channel_name']}*\n"
+            f"Current Setting: *{r_desc}*\n\n"
+            f"Select target percentage of worker accounts that will react to each new post in this channel (selected strictly from workers who viewed):"
+        )
+        await query.edit_message_text(
+            text,
+            reply_markup=_channel_reaction_menu_kb(ch_id, r_setting, c_val),
+            parse_mode="Markdown",
+        )
+
+    # ─── Set Reaction Setting ───────────────────────────────────── #
+    elif data.startswith("ch_rset:"):
+        if not _can_manage_channels(user_id):
+            await query.answer("⛔ Not authorized", show_alert=True)
+            return
+        parts = data.split(":")
+        ch_id = parts[1]
+        val = parts[2]
+        ch = db.get_channel(ch_id)
+        if not ch:
+            await query.answer("Channel not found.", show_alert=True)
+            return
+
+        if val in ("30", "40", "50"):
+            db.update_channel_reaction_setting(ch["channel_id"], val)
+            await reactor.reload_channels()
+            try:
+                await query.answer(f"✅ Reaction target set to {val}% for {ch['channel_name']}!", show_alert=False)
+            except Exception:
+                pass
+
+            text = (
+                f"⚡ *Control Reaction Menu*\n\n"
+                f"Channel: *{ch['channel_name']}*\n"
+                f"Current Setting: *{val}%*\n\n"
+                f"Select target percentage of worker accounts that will react to each new post in this channel (selected strictly from workers who viewed):"
+            )
+            await query.edit_message_text(
+                text,
+                reply_markup=_channel_reaction_menu_kb(ch_id, val),
+                parse_mode="Markdown",
+            )
+        elif val == "custom":
+            user_states[user_id] = {
+                "step": "custom_reaction_val",
+                "data": {
+                    "ch_db_id": ch_id,
+                    "channel_id": ch["channel_id"],
+                    "channel_name": ch["channel_name"],
+                },
+            }
+            await query.edit_message_text(
+                f"✏️ *Custom Reaction Percentage*\n\n"
+                f"Channel: *{ch['channel_name']}*\n\n"
+                f"Please reply in chat with an integer between *1 and 100* for the reaction percentage:\n"
+                f"_(e.g. `25` or `60`)_",
+                reply_markup=InlineKeyboardMarkup([[_back_button(f"ch_rmenu:{ch_id}")]]),
+                parse_mode="Markdown",
+            )
 
     elif data.startswith("ch_del:"):
         ch_id = data.split(":", 1)[1]
@@ -1994,6 +2261,47 @@ async def _route_text(msg: Any, user_id: int, state: dict) -> None:  # noqa: C90
                 reply_markup=InlineKeyboardMarkup([[_back_button("emojis")]]),
                 parse_mode="Markdown",
             )
+
+    # ── Custom reaction percentage (1-100%) ───────────────────── #
+    elif step == "custom_reaction_val":
+        data_ctx = state.get("data", {})
+        raw_val = text.strip().rstrip("%")
+        try:
+            num = int(raw_val)
+            if not (1 <= num <= 100):
+                raise ValueError
+        except ValueError:
+            ch_db_id = data_ctx.get("ch_db_id")
+            bk = InlineKeyboardMarkup([[_back_button(f"ch_rmenu:{ch_db_id}")]]) if ch_db_id else None
+            await msg.reply_text(
+                "❗ Invalid percentage. Please enter a whole number between *1 and 100* (e.g. `25` or `60`):\n"
+                "_(Or tap Back / type /cancel to abort)_",
+                reply_markup=bk,
+                parse_mode="Markdown",
+            )
+            return
+
+        # Input is valid – consume state
+        user_states.pop(user_id, None)
+
+        ch_tg_id = data_ctx.get("channel_id")
+        ch_name = data_ctx.get("channel_name", "Channel")
+        ch_db_id = data_ctx.get("ch_db_id")
+
+        db.update_channel_reaction_setting(ch_tg_id, "custom", custom_reaction_val=num)
+        await reactor.reload_channels()
+
+        await msg.reply_text(
+            f"✅ Custom reaction percentage set to *{num}%* for channel *{ch_name}*!\n\n"
+            f"For every new post in this channel, {num}% of the worker accounts (from those who viewed) will react with the single configured emoji.",
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [InlineKeyboardButton("⚡ Return to Reaction Menu", callback_data=f"ch_rmenu:{ch_db_id}")],
+                    [InlineKeyboardButton("📡 Return to Channel", callback_data=f"ch:{ch_db_id}")],
+                ]
+            ),
+            parse_mode="Markdown",
+        )
 
     # ── Add role – step 1: receive user ID or @username ────────── #
     elif step == "add_role_user":
