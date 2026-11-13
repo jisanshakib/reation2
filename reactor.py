@@ -1674,128 +1674,52 @@ class Reactor:
         task.add_done_callback(self._bg_tasks.discard)
 
     async def _sweep_reactions(self, chat_id: int, msg_id: int) -> None:
-        """React to a post using the Per-Channel View & Reaction Control System.
+        """React to a post across all connected accounts with guaranteed
+        multi-account delivery, per-account circuit breaker, and dynamic
+        join→react→leave lifecycle.
 
-        1. Fetches target channel config from DB (view_setting, reaction_setting, custom_reaction_val).
-        2. Calculates target views:
-           - Picks 70%, 80%, 90% (or randomly if 'random') of connected worker accounts.
-           - Triggers GetMessagesViewsRequest for that randomly sampled subset.
-        3. Calculates target reactions:
-           - Calculates percentage (30%, 40%, 50%, or custom admin value).
-           - Strictly samples subset from the workers who viewed the post.
-           - Triggers SendReactionRequest using a single configured emoji (no mixed pool).
-        4. Guarantees strict per-channel isolation.
+        **Lifecycle**:
+        1. Pre-join: ensure every worker account is a member of the channel.
+        2. React: guaranteed delivery with retry + circuit breaker.
+        3. Post-leave: workers auto-leave the channel (master stays).
+
+        Tracks per-account success/failure with an attempt counter.
+        Failed accounts (due to network timeout, temporary FloodWait,
+        or connection drop) are retried with exponential backoff.
+
+        Circuit breaker: if an account hits ``_MAX_ACCOUNT_ATTEMPTS``
+        transient failures for this post, it is auto-marked as 'failed'
+        in the database, disconnected, and an alert is sent to the admin.
+        This prevents the queue from getting stuck on a broken account.
+
+        Fatal errors (session revoked, account banned) and permanent
+        channel errors (private/forbidden/invalid-peer) trip the breaker
+        immediately on the first occurrence.
         """
         async with self._sweep_sem:
-            ch_config = self.db.get_channel_by_tg_id(chat_id)
-            ch_name = ch_config.get("channel_name") if ch_config else self._channel_name_for(chat_id)
-            view_setting = (ch_config.get("view_setting") or "random") if ch_config else "random"
-            reaction_setting = (ch_config.get("reaction_setting") or "40") if ch_config else "40"
-            custom_val = ch_config.get("custom_reaction_val") if ch_config else None
-
-            # ── Step 0: Identify available connected worker pool ─────
-            worker_items = [
-                (acc_id, client)
-                for acc_id, client in self.clients.items()
-                if client.is_connected() and acc_id != self.master_id
-            ]
-            if not worker_items:
-                worker_items = [
-                    (acc_id, client)
-                    for acc_id, client in self.clients.items()
-                    if client.is_connected()
-                ]
-
-            total_workers = len(worker_items)
-            if total_workers == 0:
-                log.warning("Sweep %s/%s [%s]: No connected accounts available", chat_id, msg_id, ch_name)
-                return
-
-            # ── Step A: Calculate Views & Trigger View Increments ─────
-            if view_setting == "random":
-                chosen_view_pct = random.choice([70, 80, 90])
-            else:
-                try:
-                    chosen_view_pct = int(view_setting)
-                except (ValueError, TypeError):
-                    chosen_view_pct = random.choice([70, 80, 90])
-
-            target_views_count = int(total_workers * (chosen_view_pct / 100.0))
-            target_views_count = max(1, min(total_workers, target_views_count))
-
-            # Select exact number of worker accounts randomly from pool
-            selected_view_accounts = random.sample(worker_items, target_views_count)
-
             log.info(
-                "Sweep %s/%s [%s]: view_setting=%s -> %d%% views (%d/%d workers)",
+                "Sweep %s/%s – %d accounts, %d emojis",
                 chat_id,
                 msg_id,
-                ch_name,
-                view_setting,
-                chosen_view_pct,
-                target_views_count,
-                total_workers,
+                len(self.clients),
+                len(self.allowed_emojis),
             )
 
-            # Ensure accounts are joined and trigger view increments
-            viewed_accounts: list[tuple[str, TelegramClient]] = []
-            for acc_id, client in selected_view_accounts:
-                acc_label = acc_id[:8]
-                try:
-                    await self._join_client_to_channel(acc_id, client, chat_id)
-                    peer = await self._resolve_peer(acc_id, client, chat_id)
-                    await self._send_view_increment(client, peer, msg_id, acc_label=acc_label)
-                    viewed_accounts.append((acc_id, client))
-                except Exception as e:
-                    log.debug("View increment failed for %s on %s/%s: %s", acc_label, chat_id, msg_id, e)
-                await asyncio.sleep(0.2)
+            # ── Step A: Pre-reaction join check ──────────────────────
+            for acc_id, client in list(self.clients.items()):
+                if acc_id == self.master_id:
+                    continue  # master already joined and monitoring
+                if not client.is_connected():
+                    continue
+                await self._join_client_to_channel(acc_id, client, chat_id)
+                await asyncio.sleep(0.3)
 
-            if not viewed_accounts:
-                viewed_accounts = selected_view_accounts
-
-            # ── Step B: Calculate Reactions & Select Single Emoji ─────
-            if reaction_setting == "custom":
-                try:
-                    chosen_react_pct = int(custom_val or 40)
-                except (ValueError, TypeError):
-                    chosen_react_pct = 40
-            else:
-                try:
-                    chosen_react_pct = int(reaction_setting)
-                except (ValueError, TypeError):
-                    chosen_react_pct = 40
-
-            chosen_react_pct = max(1, min(100, chosen_react_pct))
-            target_reactions_count = int(total_workers * (chosen_react_pct / 100.0))
-            target_reactions_count = max(1, target_reactions_count)
-
-            # Strictly select subset from workers who viewed the post
-            actual_react_count = min(target_reactions_count, len(viewed_accounts))
-            selected_react_accounts = random.sample(viewed_accounts, actual_react_count)
-
-            if not self.allowed_emojis:
-                log.debug("Sweep %s/%s: No emojis configured – views sent, reactions skipped", chat_id, msg_id)
-                return
-
-            # Single configured emoji for this post execution cycle (no mixed pool)
-            chosen_emoji = random.choice(self.allowed_emojis)
-            emoji_list = [chosen_emoji]
-
-            log.info(
-                "Sweep %s/%s [%s]: reaction_setting=%s -> %d%% reactions (%d workers from %d viewers) with single emoji '%s'",
-                chat_id,
-                msg_id,
-                ch_name,
-                reaction_setting,
-                chosen_react_pct,
-                len(selected_react_accounts),
-                len(viewed_accounts),
-                chosen_emoji,
-            )
-
-            # ── Step C: Guaranteed Reaction Delivery with Retries ────
+            # ── Step B: Guaranteed reaction with retry ───────────────
+            # Per-account attempt counter for transient failures.
             attempt_counts: dict[str, int] = {}
-            pending: set[str] = {acc_id for acc_id, _ in selected_react_accounts}
+
+            # Build the list of account IDs that need to react.
+            pending: set[str] = set(self.clients.keys())
             succeeded: set[str] = set()
             permanently_failed: set[str] = set()
             circuit_broken: set[str] = set()  # auto-deactivated accounts
@@ -1888,7 +1812,7 @@ class Reactor:
                             client=client,
                             peer=peer,
                             msg_id=msg_id,
-                            emojis=emoji_list,
+                            emojis=self.allowed_emojis,
                             acc_label=acc_label,
                         )
                         if result is not None:

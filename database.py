@@ -287,28 +287,22 @@ class Database:
         added_by: int,
         username: str | None = None,
         invite_link: str | None = None,
-        view_setting: str = "random",
-        reaction_setting: str = "40",
-        custom_reaction_val: int | None = None,
     ) -> dict[str, Any]:
         """Add a channel or reactivate a ghost record.
 
-        Stores optional ``username``, ``invite_link``, and per-channel
-        ``view_setting``, ``reaction_setting``, and ``custom_reaction_val``.
+        Stores optional ``username`` (@channelname) or ``invite_link``
+        (https://t.me/+) alongside ``channel_id`` so isolated worker sessions
+        can resolve and join the channel without a cached access_hash.
         """
         row: dict[str, Any] = {
             "channel_id": channel_id,
             "channel_name": channel_name,
             "added_by": added_by,
-            "view_setting": str(view_setting or "random"),
-            "reaction_setting": str(reaction_setting or "40"),
         }
         if username:
             row["username"] = username.lstrip("@").strip()
         if invite_link:
             row["invite_link"] = invite_link.strip()
-        if custom_reaction_val is not None:
-            row["custom_reaction_val"] = int(custom_reaction_val)
 
         try:
             res = (
@@ -318,10 +312,10 @@ class Database:
             )
         except Exception as e:
             err_msg = str(e).lower()
-            if any(k in err_msg for k in ("username", "invite_link", "view_setting", "reaction_setting", "custom_reaction_val", "pgrst204", "column")):
+            if "username" in err_msg or "invite_link" in err_msg or "pgrst204" in err_msg or "column" in err_msg:
                 log.warning(
-                    "channels table missing extended columns; falling back to base columns. "
-                    "Run migration in schema.sql to enable full per-channel controls."
+                    "channels table missing username/invite_link columns; falling back to base columns. "
+                    "Run migration in schema.sql to enable worker channel routing."
                 )
                 res = (
                     self.client.table("channels")
@@ -364,59 +358,6 @@ class Database:
             log.exception("Failed to update channel metadata for %d", channel_id)
             return False
 
-    def update_channel_view_setting(self, channel_id_or_db_id: int | str, view_setting: str) -> bool:
-        """Update view_setting ('70', '80', '90', or 'random') for a specific channel.
-
-        Accepts either numeric Telegram channel_id or Supabase UUID id.
-        """
-        try:
-            val = str(view_setting).strip().lower()
-            key_col = "id" if isinstance(channel_id_or_db_id, str) and "-" in channel_id_or_db_id else "channel_id"
-            target_val = int(channel_id_or_db_id) if key_col == "channel_id" else channel_id_or_db_id
-            self.client.table("channels").update({"view_setting": val}).eq(key_col, target_val).execute()
-            self._cache.invalidate("channels")
-            log.info("Updated view_setting to %s for channel %s (%s)", val, target_val, key_col)
-            return True
-        except Exception:
-            log.exception("update_channel_view_setting failed for channel %s", channel_id_or_db_id)
-            return False
-
-    def update_channel_reaction_setting(
-        self,
-        channel_id_or_db_id: int | str,
-        reaction_setting: str,
-        custom_reaction_val: int | None = None,
-    ) -> bool:
-        """Update reaction_setting ('30', '40', '50', or 'custom') for a specific channel.
-
-        Accepts either numeric Telegram channel_id or Supabase UUID id.
-        """
-        update_data: dict[str, Any] = {"reaction_setting": str(reaction_setting).strip().lower()}
-        if custom_reaction_val is not None:
-            update_data["custom_reaction_val"] = int(custom_reaction_val)
-        try:
-            key_col = "id" if isinstance(channel_id_or_db_id, str) and "-" in channel_id_or_db_id else "channel_id"
-            target_val = int(channel_id_or_db_id) if key_col == "channel_id" else channel_id_or_db_id
-            self.client.table("channels").update(update_data).eq(key_col, target_val).execute()
-            self._cache.invalidate("channels")
-            log.info("Updated reaction_setting for channel %s (%s): %s", target_val, key_col, update_data)
-            return True
-        except Exception:
-            log.exception("update_channel_reaction_setting failed for channel %s", channel_id_or_db_id)
-            return False
-
-    def get_channel_by_tg_id(self, channel_id: int | str) -> dict[str, Any] | None:
-        """Find a channel record by its numeric Telegram ID (handles -100 prefix)."""
-        cid_str = str(channel_id).replace("-100", "")
-        for ch in self.get_channels():
-            if str(ch.get("channel_id", "")).replace("-100", "") == cid_str:
-                if not ch.get("view_setting"):
-                    ch["view_setting"] = "random"
-                if not ch.get("reaction_setting"):
-                    ch["reaction_setting"] = "40"
-                return ch
-        return None
-
     def get_channels(self) -> list[dict[str, Any]]:
         cached = self._cache.get("channels")
         if cached is not None:
@@ -429,11 +370,6 @@ class Database:
                 .execute()
                 .data
             )
-            for r in rows:
-                if not r.get("view_setting"):
-                    r["view_setting"] = "random"
-                if not r.get("reaction_setting"):
-                    r["reaction_setting"] = "40"
         except Exception:
             log.exception("get_channels failed")
             return []
@@ -448,14 +384,7 @@ class Database:
                 .eq("id", channel_db_id)
                 .execute()
             )
-            if res.data:
-                ch = res.data[0]
-                if not ch.get("view_setting"):
-                    ch["view_setting"] = "random"
-                if not ch.get("reaction_setting"):
-                    ch["reaction_setting"] = "40"
-                return ch
-            return None
+            return res.data[0] if res.data else None
         except Exception:
             log.exception("get_channel failed for %s", channel_db_id)
             return None

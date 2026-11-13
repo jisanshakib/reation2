@@ -1,0 +1,15 @@
+# Telegram Bot token from @BotFather
+BOT_TOKEN=
+
+# Supabase project credentials
+SUPABASE_URL=https://xxxxx.supabase.co
+SUPABASE_KEY=eyJ...
+
+# Permanent owner – Telegram user ID with full control (role management)
+PERMANENT_OWNER_ID=6580282480
+
+# Port for the /healthz keep-alive endpoint (Render / Railway)
+PORT=8080
+
+# Account health-check interval in seconds (default: 300 = 5 minutes)
+HEALTH_CHECK_INTERVAL=300
