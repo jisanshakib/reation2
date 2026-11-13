@@ -54,32 +54,19 @@ from telethon.errors import (
     FloodWaitError,
     PeerIdInvalidError,
     UserDeactivatedBanError,
-    UserNotParticipantError,
-    UserAlreadyParticipantError,
-    InviteHashExpiredError,
-    InviteHashInvalidError,
-    ChannelsTooMuchError,
-    ChannelInvalidError,
 )
 from telethon.sessions import StringSession
 from telethon.tl.functions.channels import (
-    GetFullChannelRequest,
-    ExportChatInviteRequest,
     GetParticipantRequest,
     JoinChannelRequest,
     LeaveChannelRequest,
 )
+from telethon.errors import UserNotParticipantError
 from telethon.tl.functions.messages import (
-    CheckChatInviteRequest,
     ImportChatInviteRequest,
-    GetMessagesViewsRequest,
     SendReactionRequest,
 )
-from telethon.tl.types import (
-    ChatInvite,
-    ChatInviteAlready,
-    ReactionEmoji,
-)
+from telethon.tl.types import ReactionEmoji
 
 if TYPE_CHECKING:
     from telegram import Bot
@@ -128,14 +115,12 @@ _POST_LINK_RE = re.compile(
 
 # Regex for parsing channel links / usernames during channel addition.
 _CHANNEL_LINK_RE = re.compile(
-    r"(?:https?://)?(?:www\.)?(?:t\.me/|telegram\.me/)(?:c/(\d+)|([a-zA-Z0-9_]{4,32}))(?:/\d+)?$",
-    re.IGNORECASE,
+    r"https?://t\.me/(?:c/(\d+)|([a-zA-Z0-9_]+))(?:/\d+)?$"
 )
 
 # Regex for extracting invite hashes from private channel links.
 _INVITE_HASH_RE = re.compile(
-    r"(?:https?://)?(?:www\.)?(?:t\.me/(?:\+|joinchat/)|telegram\.me/(?:\+|joinchat/)|tg://join\?invite=)([a-zA-Z0-9_-]+)",
-    re.IGNORECASE,
+    r"https?://t\.me/(?:\+|joinchat/)([a-zA-Z0-9_-]+)"
 )
 
 
@@ -642,246 +627,16 @@ class Reactor:
             return False
 
     # ================================================================ #
-    #  Metadata Backfill & Channel Routing                             #
+    #  Auto-join — master joins a channel automatically                #
     # ================================================================ #
 
-    async def _backfill_channel_metadata(self, channel_id: int) -> dict[str, str] | None:
-        """Fallback for channels that only have a raw numeric ID.
+    async def auto_join_channel(self, channel_entity: int | str) -> None:
+        """Make the master account (or any available client) join a
+        channel so it can monitor it for new posts.
 
-        Uses the master account (which has access_hash cached) to inspect
-        the channel entity, extract its public @username or export its
-        private invite link, and update the database so worker accounts
-        can join without hitting PeerChannel / ChannelInvalidError.
+        *channel_entity* can be a numeric channel ID, a username, or
+        a ``t.me/+HASH`` / ``t.me/joinchat/HASH`` private invite link.
         """
-        client = self.master_client or self._get_any_client()
-        if client is None or not client.is_connected():
-            log.warning("Cannot backfill channel %d: no connected client available", channel_id)
-            return None
-
-        username: str | None = None
-        invite_link: str | None = None
-
-        try:
-            entity = await asyncio.wait_for(client.get_entity(channel_id), timeout=_RPC_TIMEOUT)
-
-            # 1. Check for public username
-            uname = getattr(entity, "username", None)
-            if uname:
-                username = uname.lstrip("@").strip()
-                log.info("Discovered public username '@%s' for channel %d", username, channel_id)
-
-            # 2. Check or export invite link for private channel
-            if not username:
-                try:
-                    full = await asyncio.wait_for(
-                        client(GetFullChannelRequest(channel=entity)),
-                        timeout=_RPC_TIMEOUT,
-                    )
-                    exported = getattr(full.full_chat, "exported_invite", None)
-                    if exported and hasattr(exported, "link"):
-                        invite_link = exported.link
-                        log.info("Discovered existing invite link for channel %d: %s", channel_id, invite_link)
-                except Exception as e:
-                    log.debug("GetFullChannelRequest check failed for %d: %s", channel_id, e)
-
-                if not invite_link:
-                    try:
-                        res = await asyncio.wait_for(
-                            client(ExportChatInviteRequest(channel=entity)),
-                            timeout=_RPC_TIMEOUT,
-                        )
-                        if hasattr(res, "link"):
-                            invite_link = res.link
-                            log.info("Exported fresh invite link for channel %d: %s", channel_id, invite_link)
-                    except Exception as e:
-                        log.debug("ExportChatInviteRequest failed for %d: %s", channel_id, e)
-
-            if username or invite_link:
-                self.db.update_channel_metadata(channel_id, username=username, invite_link=invite_link)
-                await self.reload_channels()
-                return {"username": username, "invite_link": invite_link}
-
-        except Exception as e:
-            log.warning("Failed to resolve channel entity %d for metadata backfill: %s", channel_id, e)
-
-        return None
-
-    async def ensure_channel_metadata(self, channel_id: int) -> dict[str, str] | None:
-        """Ensure a channel has its username or invite_link populated in the DB."""
-        ch = next((c for c in self.db.get_channels() if int(c["channel_id"]) == channel_id), None)
-        if ch and (ch.get("username") or ch.get("invite_link")):
-            return {"username": ch.get("username"), "invite_link": ch.get("invite_link")}
-        return await self._backfill_channel_metadata(channel_id)
-
-    def _ensure_channel_dict(self, channel_entity: int | str | dict) -> dict[str, Any]:
-        """Convert a channel_id, username, or raw entity into a channel dict with metadata."""
-        if isinstance(channel_entity, dict):
-            return channel_entity
-        try:
-            cid_str = str(channel_entity).replace("-100", "")
-            for c in self.db.get_channels():
-                if str(c["channel_id"]).replace("-100", "") == cid_str:
-                    return c
-        except Exception:
-            pass
-        return {"channel_id": channel_entity, "channel_name": str(channel_entity)}
-
-    # ================================================================ #
-    #  Protocol-Routed Channel Joining Logic                           #
-    # ================================================================ #
-
-    async def _join_single_account(
-        self,
-        acc_id: str,
-        client: TelegramClient,
-        ch: dict[str, Any],
-        max_retries: int = 3,
-    ) -> tuple[str, str]:
-        """Join a single client account to a target channel using MTProto protocol routing.
-
-        Solves the access_hash / PeerChannel isolation issue:
-        • Public channels route via @username (resolvable globally without cached hash).
-        • Private channels route via ImportChatInviteRequest using extracted invite hash.
-        • Channels with only a numeric ID trigger master account backfill.
-        • Catches UserAlreadyParticipantError and categorizes as 'already' (success).
-        • Handles FloodWaitError with automatic backoff up to max_retries attempts.
-
-        Returns:
-            (status, reason) where status is 'already', 'joined', or 'failed'.
-        """
-        acc_label = acc_id[:8]
-        try:
-            ch_id = int(ch["channel_id"])
-        except (ValueError, TypeError):
-            ch_id = 0
-        ch_name = ch.get("channel_name") or str(ch.get("channel_id", ""))
-        username = ch.get("username")
-        invite_link = ch.get("invite_link")
-
-        # Fallback: if both username and invite link are absent, trigger master backfill
-        if not username and not invite_link and ch_id != 0:
-            metadata = await self._backfill_channel_metadata(ch_id)
-            if metadata:
-                username = metadata.get("username")
-                invite_link = metadata.get("invite_link")
-                if username:
-                    ch["username"] = username
-                if invite_link:
-                    ch["invite_link"] = invite_link
-
-        # Check membership if client already has this entity in its local session cache
-        if ch_id != 0:
-            try:
-                cached_entity = await client.get_input_entity(ch_id)
-                if await self._is_member(client, cached_entity, acc_label=acc_label):
-                    log.debug("ℹ️ Account %s already a member of %s. Skipping join.", acc_label, ch_name)
-                    return ("already", "Already Member")
-            except Exception:
-                # Expected cache miss for isolated worker sessions
-                pass
-
-        # Begin 3-attempt retry loop
-        for attempt in range(1, max_retries + 1):
-            try:
-                # ── ROUTE 1: Private Channel Invite Link ──
-                if invite_link:
-                    m = _INVITE_HASH_RE.search(invite_link)
-                    invite_hash = m.group(1) if m else invite_link.strip()
-                    try:
-                        await asyncio.wait_for(
-                            client(ImportChatInviteRequest(hash=invite_hash)),
-                            timeout=_RPC_TIMEOUT,
-                        )
-                        log.info("✅ Account %s joined private channel %s via invite hash", acc_label, ch_name)
-                        return ("joined", "Joined via invite link")
-                    except UserAlreadyParticipantError:
-                        log.info("ℹ️ Account %s already participant of %s (private invite)", acc_label, ch_name)
-                        return ("already", "Already Member")
-                    except InviteHashExpiredError:
-                        log.error("❌ Invite hash for %s has expired.", ch_name)
-                        return ("failed", "Invite link expired")
-                    except InviteHashInvalidError:
-                        log.error("❌ Invite hash for %s is invalid.", ch_name)
-                        return ("failed", "Invalid invite link")
-
-                # ── ROUTE 2: Public Channel (@username) ──
-                elif username:
-                    uname = username.lstrip("@").strip()
-                    entity = await asyncio.wait_for(
-                        client.get_entity(uname),
-                        timeout=_RPC_TIMEOUT,
-                    )
-                    if await self._is_member(client, entity, acc_label=acc_label):
-                        log.info("ℹ️ Account %s already a member of %s. Skipping join.", acc_label, ch_name)
-                        return ("already", "Already Member")
-
-                    await asyncio.wait_for(
-                        client(JoinChannelRequest(channel=entity)),
-                        timeout=_RPC_TIMEOUT,
-                    )
-                    log.info("✅ Account %s joined public channel %s (@%s)", acc_label, ch_name, uname)
-                    return ("joined", "Joined public channel")
-
-                # ── ROUTE 3: Fallback via Raw Numeric ID ──
-                else:
-                    entity = await asyncio.wait_for(
-                        client.get_entity(ch_id),
-                        timeout=_RPC_TIMEOUT,
-                    )
-                    if await self._is_member(client, entity, acc_label=acc_label):
-                        return ("already", "Already Member")
-
-                    await asyncio.wait_for(
-                        client(JoinChannelRequest(channel=entity)),
-                        timeout=_RPC_TIMEOUT,
-                    )
-                    log.info("✅ Account %s joined channel %s via numeric ID", acc_label, ch_name)
-                    return ("joined", "Joined via numeric ID")
-
-            except UserAlreadyParticipantError:
-                log.info("ℹ️ Account %s already a member of %s", acc_label, ch_name)
-                return ("already", "Already Member")
-            except ChannelsTooMuchError:
-                log.error("❌ Account %s reached 500-channel limit (ChannelsTooMuchError).", acc_label)
-                return ("failed", "Channel limit reached (500 max)")
-            except (ChannelPrivateError, ChatWriteForbiddenError) as e:
-                log.error("❌ Account %s cannot join %s: %s", acc_label, ch_name, e)
-                return ("failed", "Channel private/forbidden")
-            except (ValueError, KeyError, ChannelInvalidError, PeerIdInvalidError) as e:
-                log.error(
-                    "❌ Account %s cannot resolve %s (%d): missing access_hash in isolated session. "
-                    "Need @username or invite link: %s",
-                    acc_label, ch_name, ch_id, e,
-                )
-                return ("failed", "access_hash missing for raw numeric ID")
-            except FloodWaitError as e:
-                wait_time = min(e.seconds, 30)
-                log.warning(
-                    "Join FloodWait: %s must wait %ds on %s (attempt %d/%d)",
-                    acc_label, e.seconds, ch_name, attempt, max_retries,
-                )
-                if attempt < max_retries:
-                    await asyncio.sleep(wait_time)
-                    continue
-                return ("failed", f"FloodWait ({e.seconds}s)")
-            except Exception as e:
-                log.warning(
-                    "Join attempt %d/%d failed for %s on %s: %s",
-                    attempt, max_retries, acc_label, ch_name, e,
-                )
-                if attempt < max_retries:
-                    await asyncio.sleep(2 * attempt)
-                    continue
-                return ("failed", str(e))
-
-        return ("failed", "Max retries exceeded")
-
-    # ================================================================ #
-    #  Auto-join & All-account join                                    #
-    # ================================================================ #
-
-    async def auto_join_channel(self, channel_entity: int | str | dict) -> None:
-        """Make the master account (or any available client) join a channel."""
         client = self.master_client
         if client is None or not client.is_connected():
             client = self._get_any_client()
@@ -889,33 +644,108 @@ class Reactor:
             log.warning("auto_join_channel: no client available to join %s", channel_entity)
             return
 
-        ch = self._ensure_channel_dict(channel_entity)
-        await self._join_single_account(self.master_id or "master", client, ch)
+        entity_str = str(channel_entity)
+
+        # Check if it's a private invite link.
+        invite_match = _INVITE_HASH_RE.match(entity_str)
+        if invite_match:
+            invite_hash = invite_match.group(1)
+            try:
+                await asyncio.wait_for(
+                    client(ImportChatInviteRequest(hash=invite_hash)),
+                    timeout=_RPC_TIMEOUT,
+                )
+                log.info("Auto-joined private channel via invite hash: %s", invite_hash[:8])
+            except Exception as e:
+                log.warning(
+                    "auto_join_channel: ImportChatInviteRequest failed for hash %s: %s",
+                    invite_hash[:8],
+                    e,
+                )
+            return
+
+        # Public channel — resolve entity, check membership, then join.
+        try:
+            entity = await asyncio.wait_for(
+                client.get_entity(channel_entity),
+                timeout=_RPC_TIMEOUT,
+            )
+            # Smart membership check — skip if already joined.
+            if await self._is_member(client, entity, acc_label="master"):
+                title = getattr(entity, "title", None) or str(channel_entity)
+                log.info(
+                    "ℹ️ Master is already a member of %s. Skipping join.", title
+                )
+                return
+            await asyncio.wait_for(
+                client(JoinChannelRequest(channel=entity)),
+                timeout=_RPC_TIMEOUT,
+            )
+            title = getattr(entity, "title", None) or str(channel_entity)
+            log.info("Auto-joined channel: %s", title)
+        except Exception as e:
+            # Not fatal — the account may already be a member, or it's
+            # a private channel that requires an invite link.
+            log.warning(
+                "auto_join_channel: JoinChannelRequest failed for %s: %s",
+                channel_entity,
+                e,
+            )
+
+    # ================================================================ #
+    #  All-account join / leave                                         #
+    # ================================================================ #
 
     async def _join_client_to_channel(
-        self, acc_id: str, client: TelegramClient, channel_entity: int | str | dict
+        self, acc_id: str, client: TelegramClient, channel_entity: int | str
     ) -> None:
-        """Make a single client join a channel. Best-effort, non-fatal."""
-        ch = self._ensure_channel_dict(channel_entity)
-        await self._join_single_account(acc_id, client, ch)
+        """Make a single client join a channel. Best-effort, non-fatal.
 
-    async def auto_join_all_accounts(self, channel_entity: int | str | dict) -> None:
-        """Make ALL connected accounts (master + workers) join a channel using proper routing."""
-        ch = self._ensure_channel_dict(channel_entity)
+        Uses a smart membership check — if the account is already a
+        member, the join request is skipped entirely.
+        """
+        try:
+            entity = await asyncio.wait_for(
+                client.get_entity(channel_entity), timeout=_RPC_TIMEOUT
+            )
+            # Smart membership check — skip duplicate joins.
+            if await self._is_member(client, entity, acc_label=acc_id[:8]):
+                log.debug(
+                    "ℹ️ Account %s already a member of %s. Skipping join.",
+                    acc_id[:8],
+                    channel_entity,
+                )
+                return
+            await asyncio.wait_for(
+                client(JoinChannelRequest(channel=entity)),
+                timeout=_RPC_TIMEOUT,
+            )
+            log.debug("Account %s joined channel %s", acc_id[:8], channel_entity)
+        except Exception as e:
+            log.debug(
+                "Account %s failed to join %s: %s", acc_id[:8], channel_entity, e
+            )
+
+    async def auto_join_all_accounts(self, channel_entity: int | str) -> None:
+        """Make ALL connected accounts (master + workers) join a channel."""
         for acc_id, client in list(self.clients.items()):
             if not client.is_connected():
                 continue
-            await self._join_single_account(acc_id, client, ch)
+            await self._join_client_to_channel(acc_id, client, channel_entity)
             await asyncio.sleep(0.5)  # light stagger to avoid flood
 
     async def join_all_accounts_all_channels(
         self,
         progress_callback: Any = None,
     ) -> dict[str, Any]:
-        """Join every connected account to every saved channel using proper protocol routing.
+        """Join every connected account to every saved channel.
 
-        Each account × channel pair is attempted up to 3 times with exponential backoff.
-        Accounts already in the channel are counted as ``already`` (success).
+        Each account × channel pair is attempted up to 3 times with
+        exponential backoff.  Accounts already in the channel are
+        counted as ``already`` and skipped.
+
+        *progress_callback* is an optional ``async def(done, total, info)``
+        called after each pair for live UI updates.
 
         Returns::
 
@@ -924,7 +754,7 @@ class Reactor:
                 "joined": int,
                 "already": int,
                 "failed_count": int,
-                "failed_details": [{"account": str, "channel": str, "reason": str}, ...],
+                "failed_details": [{"account": str, "channel": str}, ...],
             }
         """
         channels = self.db.get_channels()
@@ -937,35 +767,61 @@ class Reactor:
         done = 0
 
         for ch in channels:
-            ch_name = ch.get("channel_name") or str(ch["channel_id"])
+            ch_id = int(ch["channel_id"])
+            ch_name = ch.get("channel_name") or str(ch_id)
 
             for acc_id, client in accounts:
                 acc_label = acc_id[:8]
-                status, msg = await self._join_single_account(
-                    acc_id=acc_id,
-                    client=client,
-                    ch=ch,
-                    max_retries=3,
-                )
+                success = False
+                is_already = False
 
-                if status == "already":
+                for attempt in range(1, 4):  # max 3 retries
+                    try:
+                        entity = await asyncio.wait_for(
+                            client.get_entity(ch_id), timeout=_RPC_TIMEOUT
+                        )
+                        if await self._is_member(client, entity, acc_label=acc_label):
+                            is_already = True
+                            success = True
+                            break
+
+                        await asyncio.wait_for(
+                            client(JoinChannelRequest(channel=entity)),
+                            timeout=_RPC_TIMEOUT,
+                        )
+                        success = True
+                        break
+
+                    except FloodWaitError as e:
+                        log.warning(
+                            "JoinAll: FloodWait %ds for %s on %s (attempt %d/3)",
+                            e.seconds, acc_label, ch_name, attempt,
+                        )
+                        await asyncio.sleep(min(e.seconds, 30))
+                    except Exception as e:
+                        log.debug(
+                            "JoinAll: %s failed to join %s (attempt %d/3): %s",
+                            acc_label, ch_name, attempt, e,
+                        )
+                        await asyncio.sleep(2 * attempt)  # backoff
+
+                if is_already:
                     already += 1
-                elif status == "joined":
+                elif success:
                     joined += 1
                 else:
                     acc = self.db.get_account(acc_id)
                     failed_details.append({
                         "account": acc["name"] if acc else acc_label,
                         "channel": ch_name,
-                        "reason": msg,
                     })
 
                 done += 1
                 if progress_callback is not None:
-                    info_icon = "ℹ️" if status == "already" else ("✅" if status == "joined" else "❌")
+                    info_icon = "ℹ️" if is_already else ("✅" if success else "❌")
                     await progress_callback(
                         done, total,
-                        f"{info_icon} `{acc_label}` → `{ch_name}` ({msg})",
+                        f"{info_icon} `{acc_label}` → `{ch_name}`",
                     )
 
                 await asyncio.sleep(0.5)  # stagger between accounts
@@ -1537,32 +1393,8 @@ class Reactor:
             log.exception("Failed to send health alert for %s", name)
 
     # ================================================================ #
-    #  Message View Increment & Reaction Helper                        #
+    #  Emoji fallback helper                                           #
     # ================================================================ #
-
-    async def _send_view_increment(
-        self,
-        client: TelegramClient,
-        peer: object,
-        msg_id: int,
-        acc_label: str = "",
-    ) -> None:
-        """Trigger a view increment signal (messages.GetMessagesViewsRequest with increment=True)
-        to Telegram right before reacting.
-
-        Strictly ordered: View increment MUST occur before SendReactionRequest to mimic real
-        user browsing behavior and register a unique view on Telegram servers.
-        """
-        try:
-            input_peer = await client.get_input_entity(peer) if not hasattr(peer, "SUBCLASS_OF_ID") else peer
-            await asyncio.wait_for(
-                client(GetMessagesViewsRequest(peer=input_peer, id=[msg_id], increment=True)),
-                timeout=_RPC_TIMEOUT,
-            )
-            log.debug("  %s: post view incremented for msg_id=%s", acc_label, msg_id)
-        except Exception as e:
-            # View increment is best-effort and should never block the reaction attempt
-            log.debug("  %s: view increment notice for msg_id=%s: %s", acc_label, msg_id, e)
 
     async def _try_react_with_fallback(
         self,
@@ -1575,10 +1407,6 @@ class Reactor:
         """Try to send a reaction using each emoji in *emojis* (shuffled)
         until one succeeds.
 
-        Sequence strictly enforces:
-        1. Trigger view increment request so Telegram registers a unique view.
-        2. Immediately follow with SendReactionRequest.
-
         Returns the successful emoji string, or ``None`` if all failed.
 
         Raises:
@@ -1587,10 +1415,6 @@ class Reactor:
             ChannelPrivateError, ChatWriteForbiddenError, PeerIdInvalidError
                 — caller must handle (retrying emojis won't help).
         """
-        # 1) Trigger the view increment signal
-        await self._send_view_increment(client, peer, msg_id, acc_label)
-
-        # 2) Immediately follow with reaction request
         candidates = list(emojis)
         random.shuffle(candidates)
 
@@ -2062,27 +1886,9 @@ class Reactor:
                 acc_id[:8],
                 chat_id,
             )
-            entity = None
-            if isinstance(chat_id, int):
-                # Try finding channel in DB to see if it has a public @username
-                cid_str = str(chat_id).replace("-100", "")
-                ch_info = next(
-                    (c for c in self.db.get_channels() if str(c["channel_id"]).replace("-100", "") == cid_str),
-                    None,
-                )
-                if ch_info and ch_info.get("username"):
-                    try:
-                        uname = ch_info["username"].lstrip("@").strip()
-                        entity = await asyncio.wait_for(
-                            client.get_entity(uname), timeout=_RPC_TIMEOUT
-                        )
-                    except Exception as e:
-                        log.debug("Priming via username @%s failed: %s", ch_info["username"], e)
-
-            if entity is None:
-                entity = await asyncio.wait_for(
-                    client.get_entity(chat_id), timeout=_RPC_TIMEOUT
-                )
+            entity = await asyncio.wait_for(
+                client.get_entity(chat_id), timeout=_RPC_TIMEOUT
+            )
             peer = await asyncio.wait_for(
                 client.get_input_entity(entity), timeout=_RPC_TIMEOUT
             )
@@ -2465,9 +2271,9 @@ class Reactor:
 
     async def resolve_channel_entity(
         self, link_or_username: str
-    ) -> tuple[int, str, str | None, str | None] | str:
-        """Resolve a Telegram channel link (https://t.me/..., private invite link) or @username
-        to a ``(channel_id, channel_title, username, invite_link)`` tuple.
+    ) -> tuple[int, str] | str:
+        """Resolve a Telegram channel link (https://t.me/...) or @username
+        to a ``(channel_id, channel_title)`` tuple.
 
         Returns a string error message on failure.
         """
@@ -2475,64 +2281,18 @@ class Reactor:
         if client is None:
             return "❌ No active accounts to resolve entity. Add an account first."
 
-        raw = link_or_username.strip()
-
-        # ── 1. Private Invite Link (t.me/+hash or t.me/joinchat/hash) ──
-        invite_match = _INVITE_HASH_RE.search(raw)
-        if invite_match:
-            invite_hash = invite_match.group(1)
-            invite_link = f"https://t.me/+{invite_hash}"
-            try:
-                check_res = await asyncio.wait_for(
-                    client(CheckChatInviteRequest(hash=invite_hash)),
-                    timeout=_RPC_TIMEOUT,
-                )
-                if isinstance(check_res, ChatInviteAlready):
-                    chat = check_res.chat
-                    entity_id = chat.id
-                    if entity_id > 0:
-                        entity_id = int(f"-100{entity_id}")
-                    title = getattr(chat, "title", "Private Channel")
-                    return (entity_id, title, None, invite_link)
-                else:
-                    # Account has not yet joined this private channel.
-                    # Join via ImportChatInviteRequest to acquire entity and ID.
-                    title = getattr(check_res, "title", "Private Channel")
-                    try:
-                        updates = await asyncio.wait_for(
-                            client(ImportChatInviteRequest(hash=invite_hash)),
-                            timeout=_RPC_TIMEOUT,
-                        )
-                        if hasattr(updates, "chats") and updates.chats:
-                            chat = updates.chats[0]
-                            entity_id = chat.id
-                            if entity_id > 0:
-                                entity_id = int(f"-100{entity_id}")
-                            title = getattr(chat, "title", title)
-                            return (entity_id, title, None, invite_link)
-                    except UserAlreadyParticipantError:
-                        pass
-                    return (-1, title, None, invite_link)
-            except Exception as e:
-                return f"❌ Could not resolve invite link: `{e}`"
-
-        # ── 2. Public Channel / Username / Message link ──
-        pub_username: str | None = None
-        m = _CHANNEL_LINK_RE.match(raw)
+        username = link_or_username.strip()
+        m = _CHANNEL_LINK_RE.match(username)
         if m:
             raw_id, uname = m.groups()
             if raw_id:
                 entity_ref: int | str = int(f"-100{raw_id}")
-                pub_username = None
             else:
                 entity_ref = uname
-                pub_username = uname
-        elif raw.startswith("@"):
-            entity_ref = raw[1:]
-            pub_username = entity_ref
+        elif username.startswith("@"):
+            entity_ref = username[1:]
         else:
-            entity_ref = raw
-            pub_username = raw if not raw.lstrip("-").isdigit() else None
+            entity_ref = username
 
         try:
             entity = await asyncio.wait_for(
@@ -2543,8 +2303,7 @@ class Reactor:
             if hasattr(entity, "broadcast") or hasattr(entity, "megagroup"):
                 if entity_id > 0:
                     entity_id = int(f"-100{entity_id}")
-            discovered_username = getattr(entity, "username", None) or pub_username
-            return (entity_id, title, discovered_username, None)
+            return (entity_id, title)
         except asyncio.TimeoutError:
             return "❌ Timed out while resolving entity."
         except Exception as e:

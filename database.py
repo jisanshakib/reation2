@@ -281,82 +281,27 @@ class Database:
     # ================================================================ #
 
     def add_channel(
-        self,
-        channel_id: int,
-        channel_name: str,
-        added_by: int,
-        username: str | None = None,
-        invite_link: str | None = None,
+        self, channel_id: int, channel_name: str, added_by: int
     ) -> dict[str, Any]:
         """Add a channel or reactivate a ghost record.
 
-        Stores optional ``username`` (@channelname) or ``invite_link``
-        (https://t.me/+) alongside ``channel_id`` so isolated worker sessions
-        can resolve and join the channel without a cached access_hash.
+        Uses ``upsert`` with ``on_conflict="channel_id"`` so that if an
+        old row with the same ``channel_id`` still exists (ghost record
+        from a failed delete or Supabase RLS edge case), it is cleanly
+        overwritten instead of crashing with error 23505.
         """
-        row: dict[str, Any] = {
+        row = {
             "channel_id": channel_id,
             "channel_name": channel_name,
             "added_by": added_by,
         }
-        if username:
-            row["username"] = username.lstrip("@").strip()
-        if invite_link:
-            row["invite_link"] = invite_link.strip()
-
-        try:
-            res = (
-                self.client.table("channels")
-                .upsert(row, on_conflict="channel_id")
-                .execute()
-            )
-        except Exception as e:
-            err_msg = str(e).lower()
-            if "username" in err_msg or "invite_link" in err_msg or "pgrst204" in err_msg or "column" in err_msg:
-                log.warning(
-                    "channels table missing username/invite_link columns; falling back to base columns. "
-                    "Run migration in schema.sql to enable worker channel routing."
-                )
-                res = (
-                    self.client.table("channels")
-                    .upsert(
-                        {
-                            "channel_id": channel_id,
-                            "channel_name": channel_name,
-                            "added_by": added_by,
-                        },
-                        on_conflict="channel_id",
-                    )
-                    .execute()
-                )
-            else:
-                raise
-
+        res = (
+            self.client.table("channels")
+            .upsert(row, on_conflict="channel_id")
+            .execute()
+        )
         self._cache.invalidate("channels")
         return res.data[0]
-
-    def update_channel_metadata(
-        self,
-        channel_id: int,
-        username: str | None = None,
-        invite_link: str | None = None,
-    ) -> bool:
-        """Update username and/or invite_link for an existing channel record."""
-        update_data: dict[str, Any] = {}
-        if username is not None:
-            update_data["username"] = username.lstrip("@").strip()
-        if invite_link is not None:
-            update_data["invite_link"] = invite_link.strip()
-        if not update_data:
-            return False
-        try:
-            self.client.table("channels").update(update_data).eq("channel_id", channel_id).execute()
-            self._cache.invalidate("channels")
-            log.info("Updated channel metadata for %d: %s", channel_id, update_data)
-            return True
-        except Exception:
-            log.exception("Failed to update channel metadata for %d", channel_id)
-            return False
 
     def get_channels(self) -> list[dict[str, Any]]:
         cached = self._cache.get("channels")

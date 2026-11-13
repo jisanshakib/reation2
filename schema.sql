@@ -27,15 +27,9 @@ CREATE TABLE IF NOT EXISTS channels (
     id            UUID DEFAULT gen_random_uuid() PRIMARY KEY,
     channel_id    BIGINT       NOT NULL UNIQUE,
     channel_name  TEXT         NOT NULL,
-    username      TEXT,
-    invite_link   TEXT,
     added_by      BIGINT       NOT NULL,
     created_at    TIMESTAMPTZ  NOT NULL DEFAULT now()
 );
-
--- Idempotent migrations for existing installations:
-ALTER TABLE channels ADD COLUMN IF NOT EXISTS username TEXT;
-ALTER TABLE channels ADD COLUMN IF NOT EXISTS invite_link TEXT;
 
 -- 3. Emojis Table
 CREATE TABLE IF NOT EXISTS emojis (

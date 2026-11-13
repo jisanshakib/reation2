@@ -1847,7 +1847,7 @@ async def _route_text(msg: Any, user_id: int, state: dict) -> None:  # noqa: C90
         user_states.pop(user_id, None)
         raw = text.strip()
 
-        if raw.startswith("https://t.me/") or raw.startswith("http://t.me/") or raw.startswith("@") or raw.startswith("t.me/"):
+        if raw.startswith("https://t.me/") or raw.startswith("http://t.me/") or raw.startswith("@"):
             progress = await msg.reply_text(
                 "🔄 Resolving channel…",
                 reply_markup=InlineKeyboardMarkup(
@@ -1870,30 +1870,14 @@ async def _route_text(msg: Any, user_id: int, state: dict) -> None:  # noqa: C90
                     )
                 return
 
-            if len(result) == 4:
-                channel_id, channel_name, username, invite_link = result
-            else:
-                channel_id, channel_name = result[:2]
-                username, invite_link = None, None
-
+            channel_id, channel_name = result
             try:
-                db.add_channel(
-                    channel_id, channel_name, user_id,
-                    username=username, invite_link=invite_link,
-                )
+                db.add_channel(channel_id, channel_name, user_id)
                 await reactor.reload_channels()
-                ch_dict = {
-                    "channel_id": channel_id,
-                    "channel_name": channel_name,
-                    "username": username,
-                    "invite_link": invite_link,
-                }
-                await reactor.auto_join_all_accounts(ch_dict)
-                route_desc = f"@{username}" if username else ("Private Invite Link" if invite_link else f"`{channel_id}`")
+                await reactor.auto_join_all_accounts(channel_id)
                 try:
                     await progress.edit_text(
                         f"✅ Channel *{channel_name}* (`{channel_id}`) added!\n"
-                        f"Routing: `{route_desc}`\n"
                         f"All accounts auto-joined.",
                         reply_markup=InlineKeyboardMarkup([[_back_button("channels")]]),
                         parse_mode="Markdown",
@@ -1901,7 +1885,6 @@ async def _route_text(msg: Any, user_id: int, state: dict) -> None:  # noqa: C90
                 except Exception:
                     await msg.reply_text(
                         f"✅ Channel *{channel_name}* (`{channel_id}`) added!\n"
-                        f"Routing: `{route_desc}`\n"
                         f"All accounts auto-joined.",
                         reply_markup=InlineKeyboardMarkup([[_back_button("channels")]]),
                         parse_mode="Markdown",
@@ -1929,7 +1912,6 @@ async def _route_text(msg: Any, user_id: int, state: dict) -> None:  # noqa: C90
                     "Examples:\n"
                     "• `https://t.me/channelname`\n"
                     "• `@channelname`\n"
-                    "• `https://t.me/+invitehash`\n"
                     "• `-1001234567890 My Channel`",
                     reply_markup=InlineKeyboardMarkup([[_back_button("channels")]]),
                     parse_mode="Markdown",
@@ -1947,15 +1929,7 @@ async def _route_text(msg: Any, user_id: int, state: dict) -> None:  # noqa: C90
             try:
                 db.add_channel(channel_id, channel_name, user_id)
                 await reactor.reload_channels()
-                # Master account fallback backfill
-                metadata = await reactor.ensure_channel_metadata(channel_id)
-                ch_dict = {
-                    "channel_id": channel_id,
-                    "channel_name": channel_name,
-                    "username": metadata.get("username") if metadata else None,
-                    "invite_link": metadata.get("invite_link") if metadata else None,
-                }
-                await reactor.auto_join_all_accounts(ch_dict)
+                await reactor.auto_join_all_accounts(channel_id)
                 await msg.reply_text(
                     f"✅ Channel *{channel_name}* added!\n"
                     f"All accounts auto-joined.",

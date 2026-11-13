@@ -38,15 +38,11 @@ log = logging.getLogger(__name__)
 
 async def post_init(app: Application) -> None:
     """Called after the bot Application is initialised but before polling."""
-    # Start health server inside PTB's active event loop
-    health_runner = await start_health_server(PORT)
-    app.bot_data["health_runner"] = health_runner
-
     reactor: Reactor = app.bot_data["reactor"]
     # Give the reactor a reference to the Bot so it can send health alerts.
     reactor.set_bot(app.bot)
     await reactor.start()
-    log.info("Reactor and Health Server initialised inside post_init.")
+    log.info("Reactor initialised inside post_init.")
 
 
 async def post_shutdown(app: Application) -> None:
@@ -97,6 +93,13 @@ def main() -> None:
 
     # Register handlers.
     setup_handlers(app, db, reactor)
+
+    # ---- Start the health-check server ----------------------------- #
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
+    health_runner = loop.run_until_complete(start_health_server(PORT))
+    app.bot_data["health_runner"] = health_runner
 
     # ---- Run the bot (blocks until Ctrl+C / SIGTERM) --------------- #
     log.info(
