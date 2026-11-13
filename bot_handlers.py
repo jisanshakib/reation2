@@ -217,8 +217,21 @@ def _channels_kb(channels: list[dict]) -> InlineKeyboardMarkup:
 def _channel_detail_kb(ch_id: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
+            [InlineKeyboardButton("🎛️ Control View & Reaction", callback_data=f"ch_ctrl:{ch_id}")],
             [InlineKeyboardButton("🗑️ Remove Channel", callback_data=f"ch_del:{ch_id}")],
             [_back_button("channels")],
+        ]
+    )
+
+
+def _channel_ctrl_kb(ch_id: str, random_view: bool, random_react: bool) -> InlineKeyboardMarkup:
+    v_btn = f"👁️ Random View: {'ON' if random_view else 'OFF'}"
+    r_btn = f"⚡ Random Reaction: {'ON' if random_react else 'OFF'}"
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton(v_btn, callback_data=f"ch_tog_v:{ch_id}")],
+            [InlineKeyboardButton(r_btn, callback_data=f"ch_tog_r:{ch_id}")],
+            [_back_button(f"ch:{ch_id}")],
         ]
     )
 
@@ -532,11 +545,13 @@ async def cmd_addadmin(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
 async def callback_handler(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:  # noqa: C901
     query = update.callback_query
     assert query is not None
-    await query.answer()
 
     user_id = query.from_user.id
     if not _is_authorized(user_id):
-        await query.answer("⛔ Unauthorised", show_alert=True)
+        try:
+            await query.answer("⛔ Unauthorised", show_alert=True)
+        except Exception:
+            pass
         return
 
     data: str = query.data or ""
@@ -563,6 +578,15 @@ async def callback_handler(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> N
                 "❌ Something went wrong. Tap /start to return.",
                 reply_markup=InlineKeyboardMarkup([[_back_button()]]),
             )
+        except Exception:
+            pass
+    finally:
+        # Acknowledge callback query if it wasn't already answered to dismiss button spinner
+        try:
+            if hasattr(query, "answered") and not query.answered:
+                await query.answer()
+            elif not hasattr(query, "answered"):
+                await query.answer()
         except Exception:
             pass
 
@@ -1131,9 +1155,139 @@ async def _route_callback(query: Any, user_id: int, role: str | None, data: str)
                 reply_markup=InlineKeyboardMarkup([[_back_button("channels")]]),
             )
             return
-        text = f"📡 *Channel*\n\n• *Name:* {ch['channel_name']}\n• *ID:* `{ch['channel_id']}`"
+
+        rand_v = bool(ch.get("random_view_enabled", False))
+        rand_r = bool(ch.get("random_react_enabled", False))
+
+        v_desc = "🟢 ON (70% – 100% dynamic)" if rand_v else "⚪ OFF (100% full pool)"
+        r_desc = "🟢 ON (30% – 70% dynamic)" if rand_r else "⚪ OFF (100% full pool)"
+
+        uname_line = f"\n• *Username:* @{ch['username']}" if ch.get("username") else ""
+        link_line = f"\n• *Invite Link:* `{ch['invite_link'][:30]}…`" if ch.get("invite_link") else ""
+
+        text = (
+            f"📡 *Channel Detail*\n\n"
+            f"• *Name:* {ch['channel_name']}\n"
+            f"• *ID:* `{ch['channel_id']}`"
+            f"{uname_line}"
+            f"{link_line}\n\n"
+            f"👁️ *Random Views:* `{v_desc}`\n"
+            f"⚡ *Random Reactions:* `{r_desc}`"
+        )
         await query.edit_message_text(
             text, reply_markup=_channel_detail_kb(ch_id), parse_mode="Markdown"
+        )
+
+    # ─── Control View & Reaction Main Menu ─────────────────────── #
+    elif data.startswith("ch_ctrl:"):
+        ch_id = data.split(":", 1)[1]
+        if not _can_manage_channels(user_id):
+            await query.answer("⛔ Not authorized", show_alert=True)
+            return
+        ch = db.get_channel(ch_id)
+        if not ch:
+            await query.edit_message_text(
+                "Channel not found.",
+                reply_markup=InlineKeyboardMarkup([[_back_button("channels")]]),
+            )
+            return
+
+        rand_v = bool(ch.get("random_view_enabled", False))
+        rand_r = bool(ch.get("random_react_enabled", False))
+
+        v_desc = "🟢 ON (70% – 100% dynamic)" if rand_v else "⚪ OFF (100% full pool)"
+        r_desc = "🟢 ON (30% – 70% dynamic)" if rand_r else "⚪ OFF (100% full pool)"
+
+        text = (
+            f"🎛️ *Per-Channel Dynamic Range Controls*\n\n"
+            f"Channel: *{ch['channel_name']}*\n"
+            f"Channel ID: `{ch['channel_id']}`\n\n"
+            f"👁️ *Random Views:* `{v_desc}`\n"
+            f"⚡ *Random Reactions:* `{r_desc}`\n\n"
+            f"Tap a button below to toggle dynamic range mode ON or OFF:"
+        )
+        await query.edit_message_text(
+            text, reply_markup=_channel_ctrl_kb(ch_id, rand_v, rand_r), parse_mode="Markdown"
+        )
+
+    # ─── Toggle Random View ────────────────────────────────────── #
+    elif data.startswith("ch_tog_v:"):
+        ch_id = data.split(":", 1)[1]
+        if not _can_manage_channels(user_id):
+            await query.answer("⛔ Not authorized", show_alert=True)
+            return
+        ch = db.get_channel(ch_id)
+        if not ch:
+            await query.answer("Channel not found.", show_alert=True)
+            return
+
+        new_val = db.toggle_channel_random_view(ch["channel_id"])
+        if new_val is None:
+            new_val = not bool(ch.get("random_view_enabled", False))
+        await reactor.reload_channels()
+
+        rand_v = new_val
+        rand_r = bool(ch.get("random_react_enabled", False))
+
+        status_text = "ON (70-100%)" if rand_v else "OFF (100%)"
+        try:
+            await query.answer(f"👁️ Random View set to {status_text}!", show_alert=False)
+        except Exception:
+            pass
+
+        v_desc = "🟢 ON (70% – 100% dynamic)" if rand_v else "⚪ OFF (100% full pool)"
+        r_desc = "🟢 ON (30% – 70% dynamic)" if rand_r else "⚪ OFF (100% full pool)"
+
+        text = (
+            f"🎛️ *Per-Channel Dynamic Range Controls*\n\n"
+            f"Channel: *{ch['channel_name']}*\n"
+            f"Channel ID: `{ch['channel_id']}`\n\n"
+            f"👁️ *Random Views:* `{v_desc}`\n"
+            f"⚡ *Random Reactions:* `{r_desc}`\n\n"
+            f"Tap a button below to toggle dynamic range mode ON or OFF:"
+        )
+        await query.edit_message_text(
+            text, reply_markup=_channel_ctrl_kb(ch_id, rand_v, rand_r), parse_mode="Markdown"
+        )
+
+    # ─── Toggle Random Reaction ────────────────────────────────── #
+    elif data.startswith("ch_tog_r:"):
+        ch_id = data.split(":", 1)[1]
+        if not _can_manage_channels(user_id):
+            await query.answer("⛔ Not authorized", show_alert=True)
+            return
+        ch = db.get_channel(ch_id)
+        if not ch:
+            await query.answer("Channel not found.", show_alert=True)
+            return
+
+        new_val = db.toggle_channel_random_react(ch["channel_id"])
+        if new_val is None:
+            new_val = not bool(ch.get("random_react_enabled", False))
+        await reactor.reload_channels()
+
+        rand_v = bool(ch.get("random_view_enabled", False))
+        rand_r = new_val
+
+        status_text = "ON (30-70%)" if rand_r else "OFF (100%)"
+        try:
+            await query.answer(f"⚡ Random Reaction set to {status_text}!", show_alert=False)
+        except Exception:
+            pass
+
+        v_desc = "🟢 ON (70% – 100% dynamic)" if rand_v else "⚪ OFF (100% full pool)"
+        r_desc = "🟢 ON (30% – 70% dynamic)" if rand_r else "⚪ OFF (100% full pool)"
+
+        text = (
+            f"🎛️ *Per-Channel Dynamic Range Controls*\n\n"
+            f"Channel: *{ch['channel_name']}*\n"
+            f"Channel ID: `{ch['channel_id']}`\n\n"
+            f"👁️ *Random Views:* `{v_desc}`\n"
+            f"⚡ *Random Reactions:* `{r_desc}`\n\n"
+            f"Tap a button below to toggle dynamic range mode ON or OFF:"
+        )
+        await query.edit_message_text(
+            text, reply_markup=_channel_ctrl_kb(ch_id, rand_v, rand_r), parse_mode="Markdown"
         )
 
     elif data.startswith("ch_del:"):
@@ -1994,6 +2148,7 @@ async def _route_text(msg: Any, user_id: int, state: dict) -> None:  # noqa: C90
                 reply_markup=InlineKeyboardMarkup([[_back_button("emojis")]]),
                 parse_mode="Markdown",
             )
+
 
     # ── Add role – step 1: receive user ID or @username ────────── #
     elif step == "add_role_user":

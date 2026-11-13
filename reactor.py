@@ -1571,9 +1571,9 @@ class Reactor:
         msg_id: int,
         emojis: list[str],
         acc_label: str,
+        shuffle: bool = False,
     ) -> str | None:
-        """Try to send a reaction using each emoji in *emojis* (shuffled)
-        until one succeeds.
+        """Try to send a reaction using each emoji in *emojis* until one succeeds.
 
         Sequence strictly enforces:
         1. Trigger view increment request so Telegram registers a unique view.
@@ -1590,9 +1590,10 @@ class Reactor:
         # 1) Trigger the view increment signal
         await self._send_view_increment(client, peer, msg_id, acc_label)
 
-        # 2) Immediately follow with reaction request
+        # 2) Follow with reaction request
         candidates = list(emojis)
-        random.shuffle(candidates)
+        if shuffle:
+            random.shuffle(candidates)
 
         last_error: Exception | None = None
 
@@ -1674,52 +1675,118 @@ class Reactor:
         task.add_done_callback(self._bg_tasks.discard)
 
     async def _sweep_reactions(self, chat_id: int, msg_id: int) -> None:
-        """React to a post across all connected accounts with guaranteed
-        multi-account delivery, per-account circuit breaker, and dynamic
-        join→react→leave lifecycle.
+        """React to a post using the Toggle-Based Dynamic Range Engine.
 
-        **Lifecycle**:
-        1. Pre-join: ensure every worker account is a member of the channel.
-        2. React: guaranteed delivery with retry + circuit breaker.
-        3. Post-leave: workers auto-leave the channel (master stays).
-
-        Tracks per-account success/failure with an attempt counter.
-        Failed accounts (due to network timeout, temporary FloodWait,
-        or connection drop) are retried with exponential backoff.
-
-        Circuit breaker: if an account hits ``_MAX_ACCOUNT_ATTEMPTS``
-        transient failures for this post, it is auto-marked as 'failed'
-        in the database, disconnected, and an alert is sent to the admin.
-        This prevents the queue from getting stuck on a broken account.
-
-        Fatal errors (session revoked, account banned) and permanent
-        channel errors (private/forbidden/invalid-peer) trip the breaker
-        immediately on the first occurrence.
+        1. Fetches target channel config from DB:
+           - random_view_enabled (bool): if True -> 70% to 100% dynamic; if False -> 100% full pool.
+           - random_react_enabled (bool): if True -> 30% to 70% dynamic; if False -> 100% full pool.
+        2. Calculates target views:
+           - pct = random.randint(70, 100) if random_view_enabled else 100
+           - target_views = max(1, round(total_workers * (pct / 100.0)))
+           - Executes GetMessagesViewsRequest(increment=True).
+        3. Calculates target reactions:
+           - pct = random.randint(30, 70) if random_react_enabled else 100
+           - target_reacts = max(1, round(total_workers * (pct / 100.0)))
+        4. Enforces strict viewer invariant:
+           - actual_reacts = min(target_reacts, len(viewed_accounts))
+           - selected_react_accounts = random.sample(viewed_accounts, actual_reacts)
+        5. Pure random emoji selection:
+           - Each reacting worker independently and randomly selects an emoji from self.allowed_emojis.
+        6. Jitter safety:
+           - asyncio.sleep(random.uniform(0.8, 2.2)) between worker requests.
         """
         async with self._sweep_sem:
+            ch_config = self.db.get_channel_by_tg_id(chat_id)
+            ch_name = ch_config.get("channel_name") if ch_config else self._channel_name_for(chat_id)
+            random_view_enabled = bool(ch_config.get("random_view_enabled", False)) if ch_config else False
+            random_react_enabled = bool(ch_config.get("random_react_enabled", False)) if ch_config else False
+
+            # ── Step 0: Identify available connected worker pool ─────
+            worker_items = [
+                (acc_id, client)
+                for acc_id, client in self.clients.items()
+                if client.is_connected() and acc_id != self.master_id
+            ]
+            if not worker_items:
+                worker_items = [
+                    (acc_id, client)
+                    for acc_id, client in self.clients.items()
+                    if client.is_connected()
+                ]
+
+            total_workers = len(worker_items)
+            if total_workers == 0:
+                log.warning("Sweep %s/%s [%s]: No connected accounts available", chat_id, msg_id, ch_name)
+                return
+
+            # ── Step A: View Calculation ─────
+            if random_view_enabled:
+                view_pct = random.randint(70, 100)
+            else:
+                view_pct = 100
+
+            target_views = max(1, min(total_workers, round(total_workers * (view_pct / 100.0))))
+
+            # Select exact number of worker accounts randomly from pool
+            selected_view_accounts = random.sample(worker_items, target_views)
+
             log.info(
-                "Sweep %s/%s – %d accounts, %d emojis",
+                "Sweep %s/%s [%s]: random_view=%s -> %d%% views (%d/%d workers)",
                 chat_id,
                 msg_id,
-                len(self.clients),
-                len(self.allowed_emojis),
+                ch_name,
+                "ON" if random_view_enabled else "OFF",
+                view_pct,
+                target_views,
+                total_workers,
             )
 
-            # ── Step A: Pre-reaction join check ──────────────────────
-            for acc_id, client in list(self.clients.items()):
-                if acc_id == self.master_id:
-                    continue  # master already joined and monitoring
-                if not client.is_connected():
-                    continue
-                await self._join_client_to_channel(acc_id, client, chat_id)
-                await asyncio.sleep(0.3)
+            # Ensure accounts are joined and trigger view increments
+            viewed_accounts: list[tuple[str, TelegramClient]] = []
+            for acc_id, client in selected_view_accounts:
+                acc_label = acc_id[:8]
+                try:
+                    await self._join_client_to_channel(acc_id, client, chat_id)
+                    peer = await self._resolve_peer(acc_id, client, chat_id)
+                    await self._send_view_increment(client, peer, msg_id, acc_label=acc_label)
+                    viewed_accounts.append((acc_id, client))
+                except Exception as e:
+                    log.debug("View increment failed for %s on %s/%s: %s", acc_label, chat_id, msg_id, e)
+                await asyncio.sleep(random.uniform(0.3, 0.8))
 
-            # ── Step B: Guaranteed reaction with retry ───────────────
-            # Per-account attempt counter for transient failures.
+            if not viewed_accounts:
+                viewed_accounts = selected_view_accounts
+
+            # ── Step B: Reaction Calculation ─────
+            if random_react_enabled:
+                react_pct = random.randint(30, 70)
+            else:
+                react_pct = 100
+
+            target_reacts = max(1, round(total_workers * (react_pct / 100.0)))
+
+            # ── Step C: Strict Viewer Invariant (reactions <= views) ─────
+            actual_reacts = min(target_reacts, len(viewed_accounts))
+            selected_react_accounts = random.sample(viewed_accounts, actual_reacts)
+
+            if not self.allowed_emojis:
+                log.debug("Sweep %s/%s: No emojis configured – views sent, reactions skipped", chat_id, msg_id)
+                return
+
+            log.info(
+                "Sweep %s/%s [%s]: random_react=%s -> %d%% reactions (%d workers from %d viewers)",
+                chat_id,
+                msg_id,
+                ch_name,
+                "ON" if random_react_enabled else "OFF",
+                react_pct,
+                len(selected_react_accounts),
+                len(viewed_accounts),
+            )
+
+            # ── Step C: Guaranteed Reaction Delivery with Retries ────
             attempt_counts: dict[str, int] = {}
-
-            # Build the list of account IDs that need to react.
-            pending: set[str] = set(self.clients.keys())
+            pending: set[str] = {acc_id for acc_id, _ in selected_react_accounts}
             succeeded: set[str] = set()
             permanently_failed: set[str] = set()
             circuit_broken: set[str] = set()  # auto-deactivated accounts
@@ -1808,12 +1875,19 @@ class Reactor:
                     try:
                         peer = await self._resolve_peer(acc_id, client, chat_id)
 
+                        # Independent pure random emoji selection per worker
+                        worker_emoji = random.choice(self.allowed_emojis)
+                        other_emojis = [e for e in self.allowed_emojis if e != worker_emoji]
+                        random.shuffle(other_emojis)
+                        candidate_emojis = [worker_emoji] + other_emojis
+
                         result = await self._try_react_with_fallback(
                             client=client,
                             peer=peer,
                             msg_id=msg_id,
-                            emojis=self.allowed_emojis,
+                            emojis=candidate_emojis,
                             acc_label=acc_label,
+                            shuffle=False,
                         )
                         if result is not None:
                             self._reacted.add(react_key)
@@ -1988,8 +2062,8 @@ class Reactor:
                             )
                             round_failures.add(acc_id)
 
-                    # 1-second delay between accounts.
-                    await asyncio.sleep(1)
+                    # Micro-staggered jitter delay between worker reaction requests (Rate-Limit Safety)
+                    await asyncio.sleep(random.uniform(0.8, 2.2))
 
                 # Update the pending set for the next round.
                 excluded = succeeded | permanently_failed | circuit_broken
@@ -2279,12 +2353,18 @@ class Reactor:
                         succeeded.add(acc_id)
                         continue
 
+                    worker_emoji = random.choice(self.allowed_emojis)
+                    other_emojis = [e for e in self.allowed_emojis if e != worker_emoji]
+                    random.shuffle(other_emojis)
+                    candidate_emojis = [worker_emoji] + other_emojis
+
                     result = await self._try_react_with_fallback(
                         client=client,
                         peer=peer,
                         msg_id=msg_id,
-                        emojis=self.allowed_emojis,
+                        emojis=candidate_emojis,
                         acc_label=acc_id[:8],
+                        shuffle=False,
                     )
                     if result:
                         self._reacted.add(ir_key)
@@ -2406,8 +2486,8 @@ class Reactor:
                         )
                         round_failures.add(acc_id)
 
-                # 1-second delay between accounts.
-                await asyncio.sleep(1)
+                # Micro-staggered jitter delay between worker requests (Rate-Limit Safety)
+                await asyncio.sleep(random.uniform(0.8, 2.2))
 
             excluded = (
                 succeeded

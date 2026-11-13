@@ -287,17 +287,20 @@ class Database:
         added_by: int,
         username: str | None = None,
         invite_link: str | None = None,
+        random_view_enabled: bool = False,
+        random_react_enabled: bool = False,
     ) -> dict[str, Any]:
         """Add a channel or reactivate a ghost record.
 
-        Stores optional ``username`` (@channelname) or ``invite_link``
-        (https://t.me/+) alongside ``channel_id`` so isolated worker sessions
-        can resolve and join the channel without a cached access_hash.
+        Stores optional ``username``, ``invite_link``, and per-channel
+        boolean toggles ``random_view_enabled`` and ``random_react_enabled`` (default False = 100%).
         """
         row: dict[str, Any] = {
             "channel_id": channel_id,
             "channel_name": channel_name,
             "added_by": added_by,
+            "random_view_enabled": bool(random_view_enabled),
+            "random_react_enabled": bool(random_react_enabled),
         }
         if username:
             row["username"] = username.lstrip("@").strip()
@@ -312,10 +315,10 @@ class Database:
             )
         except Exception as e:
             err_msg = str(e).lower()
-            if "username" in err_msg or "invite_link" in err_msg or "pgrst204" in err_msg or "column" in err_msg:
+            if any(k in err_msg for k in ("username", "invite_link", "random_view", "random_react", "pgrst204", "column")):
                 log.warning(
-                    "channels table missing username/invite_link columns; falling back to base columns. "
-                    "Run migration in schema.sql to enable worker channel routing."
+                    "channels table missing extended columns; falling back to base columns. "
+                    "Run migration in schema.sql to enable full per-channel controls."
                 )
                 res = (
                     self.client.table("channels")
@@ -358,6 +361,91 @@ class Database:
             log.exception("Failed to update channel metadata for %d", channel_id)
             return False
 
+    def toggle_channel_random_view(self, channel_id_or_db_id: int | str) -> bool | None:
+        """Flip the random_view_enabled boolean toggle for a channel.
+
+        Returns the new boolean state, or None on failure.
+        """
+        key_col = "id" if isinstance(channel_id_or_db_id, str) and "-" in channel_id_or_db_id else "channel_id"
+        target_val = int(channel_id_or_db_id) if key_col == "channel_id" else channel_id_or_db_id
+
+        if key_col == "id":
+            ch = self.get_channel(str(target_val))
+        else:
+            ch = self.get_channel_by_tg_id(target_val)
+
+        current_state = bool(ch.get("random_view_enabled", False)) if ch else False
+        new_state = not current_state
+
+        try:
+            self.client.table("channels").update({"random_view_enabled": new_state}).eq(key_col, target_val).execute()
+            self._cache.invalidate("channels")
+            log.info("Toggled random_view_enabled to %s for channel %s (%s)", new_state, target_val, key_col)
+            return new_state
+        except Exception:
+            log.exception("toggle_channel_random_view failed for channel %s", channel_id_or_db_id)
+            return None
+
+    def toggle_channel_random_react(self, channel_id_or_db_id: int | str) -> bool | None:
+        """Flip the random_react_enabled boolean toggle for a channel.
+
+        Returns the new boolean state, or None on failure.
+        """
+        key_col = "id" if isinstance(channel_id_or_db_id, str) and "-" in channel_id_or_db_id else "channel_id"
+        target_val = int(channel_id_or_db_id) if key_col == "channel_id" else channel_id_or_db_id
+
+        if key_col == "id":
+            ch = self.get_channel(str(target_val))
+        else:
+            ch = self.get_channel_by_tg_id(target_val)
+
+        current_state = bool(ch.get("random_react_enabled", False)) if ch else False
+        new_state = not current_state
+
+        try:
+            self.client.table("channels").update({"random_react_enabled": new_state}).eq(key_col, target_val).execute()
+            self._cache.invalidate("channels")
+            log.info("Toggled random_react_enabled to %s for channel %s (%s)", new_state, target_val, key_col)
+            return new_state
+        except Exception:
+            log.exception("toggle_channel_random_react failed for channel %s", channel_id_or_db_id)
+            return None
+
+    def update_channel_toggles(
+        self,
+        channel_id_or_db_id: int | str,
+        random_view_enabled: bool | None = None,
+        random_react_enabled: bool | None = None,
+    ) -> bool:
+        """Update toggle states explicitly."""
+        update_data: dict[str, Any] = {}
+        if random_view_enabled is not None:
+            update_data["random_view_enabled"] = bool(random_view_enabled)
+        if random_react_enabled is not None:
+            update_data["random_react_enabled"] = bool(random_react_enabled)
+        if not update_data:
+            return False
+        try:
+            key_col = "id" if isinstance(channel_id_or_db_id, str) and "-" in channel_id_or_db_id else "channel_id"
+            target_val = int(channel_id_or_db_id) if key_col == "channel_id" else channel_id_or_db_id
+            self.client.table("channels").update(update_data).eq(key_col, target_val).execute()
+            self._cache.invalidate("channels")
+            log.info("Updated channel toggles for %s (%s): %s", target_val, key_col, update_data)
+            return True
+        except Exception:
+            log.exception("update_channel_toggles failed for %s", channel_id_or_db_id)
+            return False
+
+    def get_channel_by_tg_id(self, channel_id: int | str) -> dict[str, Any] | None:
+        """Find a channel record by its numeric Telegram ID (handles -100 prefix)."""
+        cid_str = str(channel_id).replace("-100", "")
+        for ch in self.get_channels():
+            if str(ch.get("channel_id", "")).replace("-100", "") == cid_str:
+                ch["random_view_enabled"] = bool(ch.get("random_view_enabled", False))
+                ch["random_react_enabled"] = bool(ch.get("random_react_enabled", False))
+                return ch
+        return None
+
     def get_channels(self) -> list[dict[str, Any]]:
         cached = self._cache.get("channels")
         if cached is not None:
@@ -370,6 +458,9 @@ class Database:
                 .execute()
                 .data
             )
+            for r in rows:
+                r["random_view_enabled"] = bool(r.get("random_view_enabled", False))
+                r["random_react_enabled"] = bool(r.get("random_react_enabled", False))
         except Exception:
             log.exception("get_channels failed")
             return []
@@ -384,7 +475,12 @@ class Database:
                 .eq("id", channel_db_id)
                 .execute()
             )
-            return res.data[0] if res.data else None
+            if res.data:
+                ch = res.data[0]
+                ch["random_view_enabled"] = bool(ch.get("random_view_enabled", False))
+                ch["random_react_enabled"] = bool(ch.get("random_react_enabled", False))
+                return ch
+            return None
         except Exception:
             log.exception("get_channel failed for %s", channel_db_id)
             return None
